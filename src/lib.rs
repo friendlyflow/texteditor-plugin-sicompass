@@ -1,144 +1,46 @@
-//! Text editor provider — file-rooted code/text editor.
+//! The text editor: a file as a list of its lines.
 //!
-//! Implements the [`Provider`] trait as a normal plugin.
-//! The provider navigates a filesystem tree rooted at the user-configurable
-//! `textEditorPath` setting and, when the user enters a file, parses its content
-//! into a FFON element tree using the rules in [`parse`]:
+//! A sicompass WASM plugin. It asks for the whole disk (`"filesystem": ["/"]`
+//! in `plugin.json`, shown at install), so the sandbox preopens `/` at its real
+//! path. The plugin navigates a filesystem tree rooted at its `textEditorPath`
+//! setting and, when the user enters a file, parses its content into a FFON
+//! tree using the rules in [`parse`]:
 //!
 //! - Lines separated by `\n` are siblings.
 //! - A line ending with `:` becomes a section header (`FfonElement::Obj`).
 //! - A `{ … }` block following a section header supplies its children.
 //!
 //! Every FFON element produced from a file carries a `<src=N>` annotation
-//! that encodes the 0-based source-line index.  This lets `commit_edit` map
+//! that encodes the 0-based source-line index. This lets `commit_edit` map
 //! edits back to exact lines on disk without a lossy round-trip through the
 //! parser.
 //!
-//! When no `textEditorPath` is configured the provider defaults to the user's
-//! home directory.
+//! Undo: a line insert or delete is a `ProviderOp` with the line in its
+//! payload, and a file or folder deleted from the directory view carries its
+//! snapshot (`sicompass_sdk::fs_snapshot`), trashed through the host's
+//! `desktop.trash`.
+//!
+//! `textEditorPath` defaults to `~`, which the host expands to the user's home
+//! folder (the sandbox has no environment to find it in).
 
+mod desktop;
+pub mod localize;
 mod parse;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use desktop::{Desktop, HostDesktop};
+use sicompass_pdk::{Descriptor, Plugin, PollResult, ProviderOp, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
-use sicompass_sdk::localize;
-use sicompass_sdk::manifest::{BuiltinManifest, SettingDecl};
-use sicompass_sdk::provider::Provider;
+use sicompass_sdk::fs_snapshot;
 use sicompass_sdk::tags;
-use sicompass_sdk::timeline::{FsOpKind, FsSideEffect, TimelineEntry};
-use std::sync::OnceLock;
-
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
-use sicompass_sdk::{register_builtin_manifest, register_provider_factory};
+use sicompass_sdk::timeline::FsSideEffect;
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// Test stub: never move anything to the real OS trash from a test.
-//
-// `delete_item`'s directory-view arm and `redo` hand the target to the `trash`
-// crate, which on Linux moves it into `$XDG_DATA_HOME/Trash` — the developer's
-// own trash, which keeps every fixture forever. The delete tests here trash
-// `bye.txt`, `doomed.txt` and `doomed_dir` on every run, and together with the
-// file browser's fixtures about a thousand runs left 37 850 test files in a
-// 45 479-entry trash.
-//
-// The stub cannot be a no-op the way the history and notes stubs are: several
-// tests assert the file is *gone* after a delete, and weakening them is not an
-// option. So under the flag the item is removed permanently instead of trashed.
-// Everything a test can observe stays true — the path is gone, and a path that
-// was never there is still an error. In-app undo is unaffected either way,
-// because it replays the `fs_trash::snapshot_for_delete` snapshot taken before
-// the delete, not the trash.
-//
-// Two audiences, hence both a compile-time default and a runtime setter:
-//
-// * This crate's own unit tests get it from `cfg!(test)`. There is no
-//   per-instance override to forget, which is the point: the sink is a free
-//   function, so nothing a test constructs can opt into safety.
-// * The app's integration tests are a different binary, where this crate is an
-//   ordinary dependency compiled *without* `cfg(test)`, and they reach the
-//   provider as a `Box<dyn Provider>` with no way to set anything. They call
-//   `_set_test_no_trash(true)` once per binary instead.
-// ---------------------------------------------------------------------------
-
-static TEST_NO_TRASH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(cfg!(test));
-
-#[doc(hidden)]
-pub fn _set_test_no_trash(enabled: bool) {
-    TEST_NO_TRASH.store(enabled, std::sync::atomic::Ordering::Release);
-}
-
-#[inline]
-fn test_no_trash() -> bool {
-    TEST_NO_TRASH.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Move `path` to the OS trash, or remove it permanently when the test stub is
-/// on. Every delete in this crate goes through here; `os_trash_delete` is the
-/// only place allowed to name the `trash` crate, which
-/// `sicompass/tests/hygiene.rs` enforces.
-fn trash_delete(path: &Path) -> Result<(), trash::Error> {
-    if test_no_trash() {
-        return permanent_delete(path);
-    }
-    os_trash_delete(path)
-}
-
-/// The stubbed delete. Mirrors what a caller can observe from a successful
-/// trash: the path is gone afterwards, and a path that was not there to begin
-/// with is an error rather than a silent success.
-fn permanent_delete(path: &Path) -> Result<(), trash::Error> {
-    let unknown = |e: std::io::Error| trash::Error::Unknown {
-        description: format!("test stub: {} ({e})", path.display()),
-    };
-    // `symlink_metadata`, not `metadata`: a symlink to a directory must be
-    // unlinked, not recursed into.
-    let meta = std::fs::symlink_metadata(path).map_err(unknown)?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(path).map_err(unknown)
-    } else {
-        std::fs::remove_file(path).map_err(unknown)
-    }
-}
-
-/// Move `path` to the OS trash.
-///
-/// On macOS the `trash` crate defaults to `DeleteMethod::Finder`, which spawns
-/// `osascript` and drives Finder over an Apple event for every single delete.
-/// That needs Finder to be running and responsive, asks the user for an
-/// automation permission, plays the trash sound, and serializes badly:
-/// concurrent deletes contend on the same Apple event queue and start failing,
-/// which surfaces here as a delete silently reporting failure.
-/// `NsFileManager` calls `trashItemAtURL` directly instead — faster, silent,
-/// no extra permission, no running Finder required.
-///
-/// The tradeoff is that some macOS versions do not record the "Put Back"
-/// entry, so restoring from the Finder side may mean dragging the item out of
-/// the Trash. In-app undo is unaffected: it restores from the snapshot
-/// [`sicompass_sdk::fs_trash::snapshot_for_delete`] took before the delete.
-#[cfg(target_os = "macos")]
-fn os_trash_delete(path: &Path) -> Result<(), trash::Error> {
-    use trash::macos::{DeleteMethod, TrashContextExtMacos};
-    let mut ctx = trash::TrashContext::default();
-    ctx.set_delete_method(DeleteMethod::NsFileManager);
-    ctx.delete(path)
-}
-
-/// See the macOS variant above; everywhere else the crate default is fine.
-#[cfg(not(target_os = "macos"))]
-fn os_trash_delete(path: &Path) -> Result<(), trash::Error> {
-    trash::delete(path)
-}
+/// The `ProviderOp` commands this plugin records.
+const OP_DELETE_LINE: &str = "texteditor.delete_line";
+const OP_INSERT_LINES: &str = "texteditor.insert_lines";
+const OP_DELETE: &str = "texteditor.delete";
 
 // ---------------------------------------------------------------------------
 // TextEditorProvider
@@ -167,12 +69,15 @@ pub struct TextEditorProvider {
     /// Unified-timeline emission queue, drained by the app after each action.
     /// Populated by `delete_item` (in-file line deletes and file/folder
     /// trashing) so deletions land on the undo timeline.
-    pending_timeline_entries: Vec<TimelineEntry>,
+    pending_timeline_entries: Vec<ProviderOp>,
+    /// The OS trash, through the host (a fake in the tests).
+    desktop: Box<dyn Desktop>,
 }
 
 impl TextEditorProvider {
-    pub fn new() -> Self {
-        let text_editor_path = home_dir();
+    pub fn with_desktop(desktop: Box<dyn Desktop>) -> Self {
+        // Until the setting arrives: the host expands the manifest's `~`.
+        let text_editor_path = String::new();
         let current_fs_path = PathBuf::from(&text_editor_path);
         let current_path_str = text_editor_path.clone();
         TextEditorProvider {
@@ -186,7 +91,28 @@ impl TextEditorProvider {
             loaded_path: None,
             trailing_newline: false,
             pending_timeline_entries: Vec::new(),
+            desktop,
         }
+    }
+
+    pub fn at_root(&self) -> bool {
+        self.current_fs_path == self.root_path() && self.ffon_sub_path.is_empty()
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        self.refresh_pending
+    }
+
+    pub fn clear_needs_refresh(&mut self) {
+        self.refresh_pending = false;
+    }
+
+    fn record(&mut self, command: &str, payload: FfonElement, label: String) {
+        self.pending_timeline_entries.push(ProviderOp {
+            command: command.to_owned(),
+            payload: sicompass_pdk::encode_one(&payload),
+            label,
+        });
     }
 
     /// Reload the open file when the cached `source_lines` no longer correspond
@@ -206,17 +132,12 @@ impl TextEditorProvider {
     /// joined by `\n`, so undo can remove exactly them and redo splice back.
     fn push_insert_lines_entry(&mut self, clamp: usize, lines: &[String]) {
         let payload_text = format!("{}{}", tags::format_src(clamp), lines.join("\n"));
-        self.pending_timeline_entries
-            .push(TimelineEntry::ProviderOp {
-                provider_idx: 0, // patched by app
-                command: "texteditor.insert_lines".to_owned(),
-                payload: FfonElement::new_str(payload_text),
-                label: if lines.len() == 1 {
-                    format!("insert line {}", clamp + 1)
-                } else {
-                    format!("insert {} lines at {}", lines.len(), clamp + 1)
-                },
-            });
+        let label = if lines.len() == 1 {
+            format!("insert line {}", clamp + 1)
+        } else {
+            format!("insert {} lines at {}", lines.len(), clamp + 1)
+        };
+        self.record(OP_INSERT_LINES, FfonElement::new_str(payload_text), label);
     }
 
     fn sync_path_str(&mut self) {
@@ -228,26 +149,38 @@ impl TextEditorProvider {
         };
     }
 
+    /// `p` through every symlink along it, as the sandbox needs it
+    /// (see `sicompass_sdk::fs_links`). Navigation keeps the path the user
+    /// took; only the filesystem calls see this one.
+    fn real(&self, p: &Path) -> PathBuf {
+        self.desktop.resolve(p)
+    }
+
     fn root_path(&self) -> PathBuf {
         PathBuf::from(&self.text_editor_path)
     }
 
     fn is_in_file_view(&self) -> bool {
-        self.current_fs_path.is_file() || !self.ffon_sub_path.is_empty()
+        self.real(&self.current_fs_path).is_file() || !self.ffon_sub_path.is_empty()
     }
 
     fn list_directory(&self, dir: &Path) -> Vec<FfonElement> {
-        let mut entries: Vec<(bool, String)> = match std::fs::read_dir(dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let is_dir = e.file_type().ok()?.is_dir();
-                    Some((is_dir, name))
-                })
-                .collect(),
-            Err(_) => return vec![],
+        // `sicompass_pdk::fs::list_dir`, not `std::fs::read_dir`: inside the
+        // sandbox the latter stops at the first entry another program removed
+        // meanwhile, and loses every entry after it.
+        let dir = self.real(dir);
+        let Ok(names) = sicompass_pdk::fs::list_dir(&dir) else {
+            return vec![];
         };
+        let mut entries: Vec<(bool, String)> = names
+            .into_iter()
+            .filter_map(|name| {
+                // The entry's own type: a link to a folder is not listed as
+                // one, as before.
+                let is_dir = std::fs::symlink_metadata(dir.join(&name)).ok()?.is_dir();
+                Some((is_dir, name))
+            })
+            .collect();
         entries.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .reverse()
@@ -267,7 +200,7 @@ impl TextEditorProvider {
     /// build the annotated `cached_ffon`.  Returns `false` if the file cannot
     /// be read.
     fn load_file(&mut self) -> bool {
-        let contents = match std::fs::read_to_string(&self.current_fs_path) {
+        let contents = match std::fs::read_to_string(self.real(&self.current_fs_path)) {
             Ok(s) => s,
             Err(_) => return false,
         };
@@ -291,10 +224,9 @@ impl TextEditorProvider {
 
     fn fetch_file_content(&mut self) -> Vec<FfonElement> {
         // Load or serve from cache.
-        if self.loaded_path.as_deref() != Some(self.current_fs_path.as_path()) {
-            if !self.load_file() {
-                return vec![FfonElement::new_str("(binary or unreadable file)")];
-            }
+        if self.loaded_path.as_deref() != Some(self.current_fs_path.as_path()) && !self.load_file()
+        {
+            return vec![FfonElement::new_str("(binary or unreadable file)")];
         }
         let tree = &self.cached_ffon;
         if self.ffon_sub_path.is_empty() {
@@ -318,7 +250,7 @@ impl TextEditorProvider {
         if self.trailing_newline {
             content.push('\n');
         }
-        if std::fs::write(&self.current_fs_path, &content).is_err() {
+        if std::fs::write(self.real(&self.current_fs_path), &content).is_err() {
             return false;
         }
         // Re-derive source_lines from the freshly-written content so each
@@ -341,12 +273,9 @@ impl TextEditorProvider {
         if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
             return false;
         }
-        let old_path = self
-            .current_fs_path
-            .join(old_name.trim_end_matches('/').trim_end_matches('\\'));
-        let new_path = self
-            .current_fs_path
-            .join(new_name.trim_end_matches('/').trim_end_matches('\\'));
+        let dir = self.real(&self.current_fs_path);
+        let old_path = dir.join(old_name.trim_end_matches('/').trim_end_matches('\\'));
+        let new_path = dir.join(new_name.trim_end_matches('/').trim_end_matches('\\'));
         std::fs::rename(&old_path, &new_path).is_ok()
     }
 }
@@ -376,39 +305,29 @@ fn wrap_ffon_in_input(elements: Vec<FfonElement>) -> Vec<FfonElement> {
 // Provider trait implementation
 // ---------------------------------------------------------------------------
 
-impl Default for TextEditorProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for TextEditorProvider {
-    fn name(&self) -> &str {
-        "texteditor"
+impl Plugin for TextEditorProvider {
+    fn new() -> Self {
+        TextEditorProvider::with_desktop(Box::new(HostDesktop))
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
-        localize::t("texteditor-display-name")
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: "texteditor".to_owned(),
+            display_name: localize::t("texteditor-display-name"),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            stable_root_key: true,
+            has_editor_semantics: true,
+            path_is_filesystem: true,
+            ..Default::default()
+        }
     }
 
+    /// Start where the user's `textEditorPath` setting says.
     fn init(&mut self) {
-        // Read saved textEditorPath from config so the first fetch() shows the
-        // correct directory rather than the home-dir default.
-        if let Some(path) = sicompass_sdk::platform::main_config_path() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(root) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if let Some(val) = root
-                        .get("text editor")
-                        .and_then(|s| s.get("textEditorPath"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        self.text_editor_path = val.to_string();
-                    }
-                }
-            }
+        if let Some(val) =
+            sicompass_pdk::host::get_setting("textEditorPath").filter(|s| !s.is_empty())
+        {
+            self.text_editor_path = val;
         }
         self.current_fs_path = PathBuf::from(&self.text_editor_path);
         self.ffon_sub_path.clear();
@@ -418,6 +337,18 @@ impl Provider for TextEditorProvider {
         self.cached_ffon.clear();
         self.pending_timeline_entries.clear();
         self.sync_path_str();
+    }
+
+    fn poll(&mut self) -> PollResult {
+        let needs_refresh = self.needs_refresh();
+        self.clear_needs_refresh();
+        PollResult {
+            at_root: self.at_root(),
+            needs_refresh,
+            structural_edit_here: true,
+            dashboard_here: false,
+            ..Default::default()
+        }
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
@@ -434,11 +365,11 @@ impl Provider for TextEditorProvider {
     fn push_path(&mut self, segment: &str) {
         let clean = tags::strip_display(segment);
         let clean = clean.trim_end_matches('/');
-        if self.current_fs_path.is_file() {
+        if self.real(&self.current_fs_path).is_file() {
             self.ffon_sub_path.push(clean.to_string());
         } else {
             let candidate = self.current_fs_path.join(clean);
-            if candidate.exists() {
+            if self.real(&candidate).exists() {
                 // Entering a new path invalidates the file cache.
                 self.loaded_path = None;
                 self.source_lines.clear();
@@ -588,14 +519,14 @@ impl Provider for TextEditorProvider {
         if name.is_empty() || self.is_in_file_view() {
             return false;
         }
-        std::fs::File::create(self.current_fs_path.join(name)).is_ok()
+        std::fs::File::create(self.real(&self.current_fs_path).join(name)).is_ok()
     }
 
     fn create_directory(&mut self, name: &str) -> bool {
         if name.is_empty() || self.is_in_file_view() {
             return false;
         }
-        std::fs::create_dir(self.current_fs_path.join(name)).is_ok()
+        std::fs::create_dir(self.real(&self.current_fs_path).join(name)).is_ok()
     }
 
     fn delete_item(&mut self, name: &str) -> bool {
@@ -615,13 +546,11 @@ impl Provider for TextEditorProvider {
             }
             let payload =
                 FfonElement::new_str(format!("{}{}", tags::format_src(line_idx), verbatim,));
-            self.pending_timeline_entries
-                .push(TimelineEntry::ProviderOp {
-                    provider_idx: 0, // patched by app
-                    command: "texteditor.delete_line".to_owned(),
-                    payload,
-                    label: format!("delete line {}", line_idx + 1),
-                });
+            self.record(
+                OP_DELETE_LINE,
+                payload,
+                format!("delete line {}", line_idx + 1),
+            );
             return true;
         }
 
@@ -631,133 +560,108 @@ impl Provider for TextEditorProvider {
         if clean.is_empty() {
             return false;
         }
-        let full = self.current_fs_path.join(clean);
+        let full = self.real(&self.current_fs_path).join(clean);
         // Snapshot before trashing so an undo can restore even if the OS trash
-        // is later emptied (see `sicompass_sdk::fs_trash`).
-        let side_effect = sicompass_sdk::fs_trash::snapshot_for_delete(&full);
-        if trash_delete(&full).is_err() {
+        // is later emptied (see `sicompass_sdk::fs_snapshot`).
+        let side_effect = fs_snapshot::snapshot_for_delete(&full);
+        if self.desktop.trash(&full).is_err() {
             return false;
         }
-        // Reinsert with the original tagged key (`<dir>`/`<file>` + `<input>`),
-        // not the bare name: the text editor lists every entry as a navigable
-        // `Obj`, and the rendered `+di` / `+fi` prefix is derived from the
-        // `<dir>` / `<file>` tag. A bare name would be unnavigable *and* lose
-        // its dir/file prefix (rendering as a plain `+`).
-        let before_elem = FfonElement::new_obj(name);
-        self.pending_timeline_entries.push(TimelineEntry::FsOp {
-            provider_idx: 0, // patched by app
-            id: sicompass_sdk::ffon::IdArray::new(),
-            op: FsOpKind::Delete,
-            before: Some(before_elem),
-            after: None,
-            side_effect,
-        });
+        let payload = FfonElement::new_str(B64.encode(fs_snapshot::encode(&side_effect)));
+        self.record(OP_DELETE, payload, format!("delete {clean}"));
         true
     }
 
-    fn take_timeline_entries(&mut self) -> Vec<TimelineEntry> {
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
         std::mem::take(&mut self.pending_timeline_entries)
     }
 
-    async fn undo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        match entry {
-            TimelineEntry::FsOp {
-                op: FsOpKind::Delete,
-                side_effect,
-                ..
-            } => {
-                sicompass_sdk::fs_trash::restore_side_effect(side_effect, error);
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let Some(payload) = sicompass_pdk::decode_one(&entry.payload) else {
+            return Ok(());
+        };
+        match entry.command.as_str() {
+            OP_DELETE => {
+                let Some(side_effect) = decode_snapshot(&payload) else {
+                    return Ok(());
+                };
+                let desktop = &self.desktop;
+                fs_snapshot::restore(&side_effect, |p| desktop.restore(p))
             }
-            TimelineEntry::ProviderOp {
-                command, payload, ..
-            } if command == "texteditor.delete_line" => {
-                if let Some((idx, verbatim)) = decode_line_payload(payload) {
-                    self.ensure_file_loaded();
-                    let clamp = idx.min(self.source_lines.len());
-                    self.source_lines.splice(clamp..clamp, [verbatim]);
-                    if !self.flush_source_lines() {
-                        *error = localize::t("texteditor-error-undo-delete-line-write-failed");
-                    }
-                }
+            OP_DELETE_LINE => {
+                let Some((idx, verbatim)) = decode_line_payload(&payload) else {
+                    return Ok(());
+                };
+                self.ensure_file_loaded();
+                let clamp = idx.min(self.source_lines.len());
+                self.source_lines.splice(clamp..clamp, [verbatim]);
+                self.flush_or("texteditor-error-undo-delete-line-write-failed")
             }
-            TimelineEntry::ProviderOp {
-                command, payload, ..
-            } if command == "texteditor.insert_lines" => {
+            OP_INSERT_LINES => {
                 // Undo a line insert: remove the inserted lines back off disk.
-                if let Some((idx, joined)) = decode_line_payload(payload) {
-                    let count = joined.split('\n').count();
-                    self.ensure_file_loaded();
-                    let start = idx.min(self.source_lines.len());
-                    let end = (start + count).min(self.source_lines.len());
-                    self.source_lines.drain(start..end);
-                    if !self.flush_source_lines() {
-                        *error = localize::t("texteditor-error-undo-insert-line-write-failed");
-                    }
-                }
+                let Some((idx, joined)) = decode_line_payload(&payload) else {
+                    return Ok(());
+                };
+                let count = joined.split('\n').count();
+                self.ensure_file_loaded();
+                let start = idx.min(self.source_lines.len());
+                let end = (start + count).min(self.source_lines.len());
+                self.source_lines.drain(start..end);
+                self.flush_or("texteditor-error-undo-insert-line-write-failed")
             }
-            _ => {}
+            _ => Ok(()),
         }
     }
 
-    async fn redo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        match entry {
-            TimelineEntry::FsOp {
-                op: FsOpKind::Delete,
-                side_effect,
-                ..
-            } => {
-                // Re-trash at the absolute original path recorded in the side
-                // effect; the cursor may have moved since the delete.
-                let path: Option<&Path> = match side_effect {
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let Some(payload) = sicompass_pdk::decode_one(&entry.payload) else {
+            return Ok(());
+        };
+        match entry.command.as_str() {
+            OP_DELETE => {
+                // Re-trash at the absolute original path recorded in the
+                // snapshot; the cursor may have moved since the delete.
+                let Some(side_effect) = decode_snapshot(&payload) else {
+                    return Ok(());
+                };
+                let path: Option<&Path> = match &side_effect {
                     FsSideEffect::TrashedFile { original_path, .. }
                     | FsSideEffect::TrashedDir { original_path, .. } => Some(original_path),
                     FsSideEffect::RenameOnly { from, .. } => Some(from),
                     FsSideEffect::None => None,
                 };
-                if let Some(path) = path {
-                    // Through the wrapper, never the `trash` crate directly:
-                    // this called `trash::delete` for a long time, which on
-                    // macOS took the slow Finder/osascript path
-                    // `os_trash_delete` exists to avoid, and which walks past
-                    // the `TEST_NO_TRASH` stub.
-                    if let Err(e) = trash_delete(path) {
+                match path {
+                    Some(path) => self.desktop.trash(path).map_err(|e| {
                         let mut args = localize::Args::new();
-                        args.set("err", e.to_string());
-                        *error =
-                            localize::t_args("texteditor-error-redo-delete-trash-failed", &args);
-                    }
+                        args.set("err", e);
+                        localize::t_args("texteditor-error-redo-delete-trash-failed", &args)
+                    }),
+                    None => Ok(()),
                 }
             }
-            TimelineEntry::ProviderOp {
-                command, payload, ..
-            } if command == "texteditor.delete_line" => {
-                if let Some((idx, _)) = decode_line_payload(payload) {
-                    self.ensure_file_loaded();
-                    if idx < self.source_lines.len() {
-                        self.source_lines.remove(idx);
-                        if !self.flush_source_lines() {
-                            *error = localize::t("texteditor-error-redo-delete-line-write-failed");
-                        }
-                    }
+            OP_DELETE_LINE => {
+                let Some((idx, _)) = decode_line_payload(&payload) else {
+                    return Ok(());
+                };
+                self.ensure_file_loaded();
+                if idx >= self.source_lines.len() {
+                    return Ok(());
                 }
+                self.source_lines.remove(idx);
+                self.flush_or("texteditor-error-redo-delete-line-write-failed")
             }
-            TimelineEntry::ProviderOp {
-                command, payload, ..
-            } if command == "texteditor.insert_lines" => {
+            OP_INSERT_LINES => {
                 // Redo a line insert: splice the recorded lines back in.
-                if let Some((idx, joined)) = decode_line_payload(payload) {
-                    self.ensure_file_loaded();
-                    let lines: Vec<String> = joined.split('\n').map(str::to_owned).collect();
-                    let clamp = idx.min(self.source_lines.len());
-                    self.source_lines.splice(clamp..clamp, lines);
-                    if !self.flush_source_lines() {
-                        *error = localize::t("texteditor-error-redo-insert-line-write-failed");
-                    }
-                }
+                let Some((idx, joined)) = decode_line_payload(&payload) else {
+                    return Ok(());
+                };
+                self.ensure_file_loaded();
+                let lines: Vec<String> = joined.split('\n').map(str::to_owned).collect();
+                let clamp = idx.min(self.source_lines.len());
+                self.source_lines.splice(clamp..clamp, lines);
+                self.flush_or("texteditor-error-redo-insert-line-write-failed")
             }
-            _ => {}
+            _ => Ok(()),
         }
     }
 
@@ -776,40 +680,15 @@ impl Provider for TextEditorProvider {
         cmd: &str,
         _elem_key: &str,
         _elem_type: i32,
-        _error: &mut String,
-    ) -> Option<FfonElement> {
-        match cmd {
+    ) -> Result<Option<FfonElement>, String> {
+        Ok(match cmd {
             "create directory" => Some(FfonElement::new_obj("<input></input>")),
             "create file" => Some(FfonElement::new_str("<input></input>".to_owned())),
             _ => None,
-        }
+        })
     }
 
     // ---- Settings ----------------------------------------------------------
-
-    fn stable_root_key(&self) -> bool {
-        true
-    }
-
-    fn at_root(&self) -> bool {
-        self.current_fs_path == self.root_path() && self.ffon_sub_path.is_empty()
-    }
-
-    fn has_editor_semantics(&self) -> bool {
-        true
-    }
-
-    fn path_is_filesystem(&self) -> bool {
-        true
-    }
-
-    fn needs_refresh(&self) -> bool {
-        self.refresh_pending
-    }
-
-    fn clear_needs_refresh(&mut self) {
-        self.refresh_pending = false;
-    }
 
     fn on_setting_change(&mut self, key: &str, value: &str) {
         if key == "textEditorPath" && value != self.text_editor_path {
@@ -828,6 +707,25 @@ impl Provider for TextEditorProvider {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+export_plugin!(TextEditorProvider);
+
+impl TextEditorProvider {
+    /// Write the lines back, or say why not in the user's language.
+    fn flush_or(&mut self, error_id: &str) -> Result<(), String> {
+        if self.flush_source_lines() {
+            Ok(())
+        } else {
+            Err(localize::t(error_id))
+        }
+    }
+}
+
+/// A directory-view delete's snapshot, from its payload (base64 text).
+fn decode_snapshot(payload: &FfonElement) -> Option<FsSideEffect> {
+    let bytes = B64.decode(payload.as_str()?).ok()?;
+    fs_snapshot::decode(&bytes)
+}
 
 fn leading_whitespace(s: &str) -> &str {
     let end = s.find(|c: char| !c.is_whitespace()).unwrap_or(0);
@@ -862,34 +760,6 @@ fn build_indented_lines(text: &str, indent: &str) -> Vec<String> {
         .collect()
 }
 
-fn home_dir() -> String {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// SDK registration
-// ---------------------------------------------------------------------------
-
-/// Register the text editor provider with the SDK factory and manifest registries.
-pub fn register() {
-    let home = home_dir();
-    register_provider_factory("texteditor", || Box::new(TextEditorProvider::new()));
-    register_builtin_manifest(
-        BuiltinManifest::new("texteditor", "text editor").with_settings(vec![SettingDecl::text(
-            "text editor",
-            "text editor path",
-            "textEditorPath",
-            &home,
-        )]),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,42 +770,81 @@ mod tests {
         TempDir::new().expect("tempdir")
     }
 
+    /// The OS trash, simulated: a trashed item moves into a folder of its own
+    /// and can come back from it. Nothing a test deletes reaches the
+    /// developer's real trash.
+    #[derive(Clone, Default)]
+    struct FakeDesktop(std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, PathBuf, TempDir)>>>);
+
+    impl Desktop for FakeDesktop {
+        fn trash(&self, path: &Path) -> Result<(), String> {
+            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let dir = TempDir::new().unwrap();
+            let kept = dir.path().join("item");
+            std::fs::rename(path, &kept).map_err(|e| e.to_string())?;
+            self.0.borrow_mut().push((path.to_path_buf(), kept, dir));
+            Ok(())
+        }
+
+        fn restore(&self, path: &Path) -> Result<(), String> {
+            let mut items = self.0.borrow_mut();
+            let at = items
+                .iter()
+                .rposition(|(orig, _, _)| orig == path)
+                .ok_or("no matching item in the trash")?;
+            let (orig, kept, _dir) = items.remove(at);
+            std::fs::rename(kept, orig).map_err(|e| e.to_string())
+        }
+    }
+
+    fn editor() -> TextEditorProvider {
+        TextEditorProvider::with_desktop(Box::new(FakeDesktop::default()))
+    }
+
     fn make_text_editor(tmp: &TempDir) -> TextEditorProvider {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         p.on_setting_change("textEditorPath", tmp.path().to_str().unwrap());
         p
     }
 
-    /// No in-crate test may reach the developer's real OS trash.
-    ///
-    /// Nothing forces a delete test to opt into safety — the sink is a free
-    /// function with no per-instance override — so the `cfg!(test)` default is
-    /// the whole defence. Unlike the file browser, no test here needs the real
-    /// trash, so there is no flag guard and nothing ever turns this off.
+    /// Outside the sandbox there is no trash: the host desktop refuses, so a
+    /// native test can only ever reach the fake.
     #[test]
-    fn no_unit_test_can_reach_the_real_trash() {
-        assert!(
-            test_no_trash(),
-            "the compile-time default must keep unit tests out of the OS trash"
-        );
-
-        // And the stub must still actually delete, or every `!path.exists()`
-        // assertion in this module is inert.
+    fn natively_the_host_desktop_touches_nothing() {
         let dir = make_tmp();
         let file = dir.path().join("x.txt");
         std::fs::write(&file, b"x").unwrap();
-        assert!(trash_delete(&file).is_ok());
-        assert!(!file.exists(), "the stub must remove the file, not skip it");
+        assert!(HostDesktop.trash(&file).is_err());
+        let mut p = TextEditorProvider::new();
+        p.on_setting_change("textEditorPath", dir.path().to_str().unwrap());
+        assert!(!p.delete_item("<input>x.txt</input>"));
+        assert!(file.exists());
+    }
 
+    /// The fake must really take the item away, or every `!path.exists()`
+    /// assertion here is inert; a path that is not there stays an error.
+    #[test]
+    fn the_fake_trash_takes_items_away() {
+        let dir = make_tmp();
+        let d = FakeDesktop::default();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"x").unwrap();
+        d.trash(&file).unwrap();
+        assert!(!file.exists());
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("inner"), b"x").unwrap();
-        assert!(trash_delete(&sub).is_ok());
-        assert!(!sub.exists(), "the stub must remove directories recursively");
+        d.trash(&sub).unwrap();
+        assert!(!sub.exists());
+        assert!(d.trash(&dir.path().join("never-existed")).is_err());
+        d.restore(&file).unwrap();
+        assert!(file.exists(), "and gives it back");
+    }
 
-        // A path that is not there stays an error, so a delete of something
-        // missing keeps reporting failure rather than silent success.
-        assert!(trash_delete(&dir.path().join("never-existed")).is_err());
+    /// The directory-view delete's snapshot, out of its undo entry.
+    fn snapshot_of(entry: &ProviderOp) -> FsSideEffect {
+        assert_eq!(entry.command, OP_DELETE);
+        decode_snapshot(&sicompass_pdk::decode_one(&entry.payload).unwrap()).unwrap()
     }
 
     // ---- basic fetch / navigation ------------------------------------------
@@ -953,6 +862,7 @@ mod tests {
             loaded_path: None,
             trailing_newline: false,
             pending_timeline_entries: vec![],
+            desktop: Box::new(FakeDesktop::default()),
         };
         let items = p.fetch();
         assert_eq!(items.len(), 1);
@@ -961,7 +871,7 @@ mod tests {
 
     #[test]
     fn on_setting_change_updates_text_editor_path() {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         p.on_setting_change("textEditorPath", "/tmp/test");
         assert_eq!(p.text_editor_path, "/tmp/test");
         assert_eq!(p.current_fs_path, PathBuf::from("/tmp/test"));
@@ -969,7 +879,7 @@ mod tests {
 
     #[test]
     fn on_setting_change_sets_refresh_pending() {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         assert!(!p.needs_refresh());
         p.on_setting_change("textEditorPath", "/tmp/newpath");
         assert!(
@@ -980,7 +890,7 @@ mod tests {
 
     #[test]
     fn on_setting_change_same_path_does_not_set_refresh() {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         let same = p.text_editor_path.clone();
         p.on_setting_change("textEditorPath", &same);
         assert!(!p.needs_refresh(), "same path must not trigger a refresh");
@@ -988,7 +898,7 @@ mod tests {
 
     #[test]
     fn clear_needs_refresh_clears_flag() {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         p.on_setting_change("textEditorPath", "/tmp/other");
         assert!(p.needs_refresh());
         p.clear_needs_refresh();
@@ -997,7 +907,7 @@ mod tests {
 
     #[test]
     fn on_setting_change_ignores_other_keys() {
-        let mut p = TextEditorProvider::new();
+        let mut p = editor();
         let original = p.text_editor_path.clone();
         p.on_setting_change("someOtherKey", "/etc");
         assert_eq!(p.text_editor_path, original);
@@ -1175,15 +1085,9 @@ mod tests {
     }
 
     #[test]
-    fn register_is_idempotent() {
-        register();
-        register();
-    }
-
-    #[test]
     fn text_editor_provider_has_editor_semantics() {
-        let p = TextEditorProvider::new();
-        assert!(p.has_editor_semantics());
+        let p = editor();
+        assert!(p.describe().has_editor_semantics);
     }
 
     // ---- directory create / delete / rename --------------------------------
@@ -1508,7 +1412,7 @@ mod tests {
     // ---- delete timeline emission + undo/redo -------------------------------
 
     #[test]
-    fn delete_item_emits_fsop_with_file_snapshot() {
+    fn delete_item_records_an_undo_with_the_file_snapshot() {
         let tmp = make_tmp();
         std::fs::write(tmp.path().join("doomed.txt"), b"important content").unwrap();
         let mut p = make_text_editor(&tmp);
@@ -1518,32 +1422,23 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::FsOp {
-                op,
-                side_effect,
-                before,
-                ..
+        assert!(
+            entries[0].label.contains("doomed.txt"),
+            "{}",
+            entries[0].label
+        );
+        match snapshot_of(&entries[0]) {
+            FsSideEffect::TrashedFile {
+                content_snapshot, ..
             } => {
-                assert_eq!(*op, FsOpKind::Delete);
-                // The text editor lists files as navigable `Obj`s, so the
-                // restore element must be an `Obj` (not a bare `Str`).
-                assert!(matches!(before, Some(FfonElement::Obj(_))));
-                match side_effect {
-                    FsSideEffect::TrashedFile {
-                        content_snapshot, ..
-                    } => {
-                        assert_eq!(content_snapshot, b"important content");
-                    }
-                    other => panic!("expected TrashedFile, got {other:?}"),
-                }
+                assert_eq!(content_snapshot, b"important content");
             }
-            other => panic!("expected FsOp, got {other:?}"),
+            other => panic!("expected TrashedFile, got {other:?}"),
         }
     }
 
     #[test]
-    fn delete_item_emits_fsop_with_dir_snapshot() {
+    fn delete_item_records_an_undo_with_the_dir_snapshot() {
         let tmp = make_tmp();
         let dir = tmp.path().join("doomed_dir");
         std::fs::create_dir(&dir).unwrap();
@@ -1555,23 +1450,14 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::FsOp {
-                op,
-                side_effect,
-                before,
-                ..
-            } => {
-                assert_eq!(*op, FsOpKind::Delete);
-                assert!(matches!(before, Some(FfonElement::Obj(_))));
-                assert!(matches!(side_effect, FsSideEffect::TrashedDir { .. }));
-            }
-            other => panic!("expected FsOp, got {other:?}"),
-        }
+        assert!(matches!(
+            snapshot_of(&entries[0]),
+            FsSideEffect::TrashedDir { .. }
+        ));
     }
 
     #[test]
-    fn undo_fsop_delete_restores_file() {
+    fn undo_of_a_file_delete_restores_it() {
         let tmp = make_tmp();
         let target = tmp.path().join("doomed.txt");
         std::fs::write(&target, b"restore me").unwrap();
@@ -1582,13 +1468,15 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "undo error: {err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"restore me");
     }
 
     #[test]
-    fn undo_fsop_delete_restores_directory_tree() {
+    fn undo_of_a_folder_delete_restores_the_tree() {
         let tmp = make_tmp();
         let dir = tmp.path().join("a");
         std::fs::create_dir(&dir).unwrap();
@@ -1603,7 +1491,9 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "undo error: {err}");
         assert!(dir.is_dir());
         assert_eq!(std::fs::read(dir.join("inner.txt")).unwrap(), b"nested");
@@ -1611,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn redo_fsop_delete_removes_file_again() {
+    fn redo_of_a_delete_trashes_it_again() {
         let tmp = make_tmp();
         let target = tmp.path().join("doomed.txt");
         std::fs::write(&target, b"x").unwrap();
@@ -1620,9 +1510,13 @@ mod tests {
         assert!(p.delete_item("<input>doomed.txt</input>"));
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(target.exists());
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "redo error: {err}");
         assert!(!target.exists(), "redo deletes the file again");
     }
@@ -1642,12 +1536,7 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::ProviderOp { command, .. } => {
-                assert_eq!(command, "texteditor.delete_line");
-            }
-            other => panic!("expected ProviderOp, got {other:?}"),
-        }
+        assert_eq!(entries[0].command, "texteditor.delete_line");
     }
 
     #[test]
@@ -1671,7 +1560,9 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "undo error: {err}");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -1692,12 +1583,16 @@ mod tests {
         assert!(p.delete_item(&name));
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "alpha\nbeta\ngamma"
         );
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "redo error: {err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma");
     }
@@ -1717,11 +1612,17 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc");
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nc");
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc");
         assert!(err.is_empty(), "undo/redo error: {err}");
     }
@@ -1746,12 +1647,7 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::ProviderOp { command, .. } => {
-                assert_eq!(command, "texteditor.insert_lines");
-            }
-            other => panic!("expected ProviderOp, got {other:?}"),
-        }
+        assert_eq!(entries[0].command, "texteditor.insert_lines");
     }
 
     #[test]
@@ -1767,7 +1663,9 @@ mod tests {
         assert!(p.commit_edit(&old, "beta"));
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "undo error: {err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma");
     }
@@ -1785,9 +1683,13 @@ mod tests {
         assert!(p.commit_edit(&old, "beta"));
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma");
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "redo error: {err}");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -1815,9 +1717,13 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma");
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "alpha\nb1\nb2\ngamma"
@@ -1842,9 +1748,13 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma\n");
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n\ngamma\n");
         assert!(err.is_empty(), "undo/redo error: {err}");
     }
@@ -1865,12 +1775,7 @@ mod tests {
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::ProviderOp { command, .. } => {
-                assert_eq!(command, "texteditor.insert_lines");
-            }
-            other => panic!("expected ProviderOp, got {other:?}"),
-        }
+        assert_eq!(entries[0].command, "texteditor.insert_lines");
     }
 
     #[test]
@@ -1885,10 +1790,14 @@ mod tests {
         assert!(p.commit_edit("", "hello"));
         let entries = p.take_timeline_entries();
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        if let Err(e) = p.undo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "undo error: {err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        if let Err(e) = p.redo(&entries[0]) {
+            err = e;
+        }
         assert!(err.is_empty(), "redo error: {err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
     }
