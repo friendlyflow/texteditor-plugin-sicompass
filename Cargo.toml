@@ -18,8 +18,8 @@ crate-type = ["cdylib"]
 [dependencies]
 # The guest kit and the FFON model. By git until sicompass-sdk 0.9 and
 # sicompass-pdk 0.6 are on crates.io; the pdk uses the SDK from the same rev.
-sicompass-pdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "f32563c609508b033b71f06d17feaf43e6c6e67b" }
-sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "f32563c609508b033b71f06d17feaf43e6c6e67b", default-features = false }
+sicompass-pdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "942ac5fb925cd0ab301e41df60acfd7f84c2d54e" }
+sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "942ac5fb925cd0ab301e41df60acfd7f84c2d54e", default-features = false }
 # A delete's snapshot travels in an undo payload, which is FFON text.
 base64 = "0.22"
 
