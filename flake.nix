@@ -1,9 +1,9 @@
 {
   # Skeleton for a sicompass WASM plugin, from sicompass's /split-repo. Fill in
-  # texteditor_plugin_sicompass: a file as a list of its lines, a sicompass WASM plugin. The plugin is built for wasm32-wasip2, which nixpkgs' rustc
+  # texteditor-plugin-sicompass: a file as a list of its lines, a sicompass WASM plugin. The plugin is built for wasm32-wasip2, which nixpkgs' rustc
   # has no std for, so the toolchain comes from rust-overlay (as in
   # sicompass-plugin-sdk's flake). flake.lock pins it.
-  description = "texteditor_plugin_sicompass: a file as a list of its lines, a sicompass WASM plugin";
+  description = "texteditor-plugin-sicompass: a file as a list of its lines, a sicompass WASM plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

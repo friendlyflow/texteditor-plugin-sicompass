@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Text editor for sicompass: a file as a list of its lines, as a WASM plugin"
-repository = "https://github.com/friendlyflow/texteditor_plugin_sicompass"
+repository = "https://github.com/friendlyflow/texteditor-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 

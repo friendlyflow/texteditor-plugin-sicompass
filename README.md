@@ -1,4 +1,4 @@
-# texteditor_plugin_sicompass
+# texteditor-plugin-sicompass
 
 *Edit text files as lists, in Sicompass.*
 
