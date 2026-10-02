@@ -1802,3 +1802,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
     }
 }
+
+/// The tutorial's paragraphs about this plugin are the plugin's own:
+/// `texteditor-tutorial`, then `texteditor-tutorial-2` and so on. The tutorial reads them
+/// from the installed `locales/*.ftl`, so every language needs the same ones.
+#[cfg(test)]
+mod tutorial_text_tests {
+    const LOCALES: [(&str, &str); 4] = [
+        ("en-US", include_str!("../locales/en-US.ftl")),
+        ("nl-BE", include_str!("../locales/nl-BE.ftl")),
+        ("fr-BE", include_str!("../locales/fr-BE.ftl")),
+        ("de-BE", include_str!("../locales/de-BE.ftl")),
+    ];
+
+    /// The plugin's name, kept apart from the `-tutorial` suffix so no
+    /// half-built id appears quoted in the source.
+    const NAME: &str = "texteditor";
+
+    fn tutorial_id(line: &str) -> Option<&str> {
+        let id = line.split_once(" = ")?.0;
+        let base = format!("{NAME}-tutorial");
+        (id == base || id.starts_with(&format!("{base}-"))).then_some(id)
+    }
+
+    fn tutorial_ids(ftl: &str) -> Vec<&str> {
+        ftl.lines().filter_map(tutorial_id).collect()
+    }
+
+    #[test]
+    fn every_language_has_the_same_tutorial_leaves() {
+        let en = tutorial_ids(LOCALES[0].1);
+        assert_eq!(en, ["texteditor-tutorial"], "en-US's tutorial leaves");
+        for (locale, ftl) in &LOCALES[1..] {
+            assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
+        }
+    }
+}
