@@ -3,7 +3,7 @@
 
 [package]
 name = "texteditor-plugin"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Text editor for sicompass: a file as a list of its lines, as a plugin"
