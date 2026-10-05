@@ -1,10 +1,10 @@
-//! The OS trash, through the host.
+//! The OS trash, through the app (`sicompass_sdk::plugin::desktop`), so a
+//! delete and its undo are the app's like every other program's.
 //!
-//! A trait so the tests run natively: there the fake removes the item outright
-//! and keeps nothing, because a test must never put a fixture in the
-//! developer's real trash (about a thousand runs once left 37 850 of them
-//! there). Inside the sandbox it is the host's `desktop` interface, which only
-//! reaches paths this plugin was granted.
+//! A trait so the tests can swap it: their fake removes the item outright and
+//! keeps nothing, because a test must never put a fixture in the developer's
+//! real trash (about a thousand runs once left 37 850 of them there). Outside
+//! sicompass, [`HostDesktop`] has no app to ask, and refuses.
 
 use std::path::{Path, PathBuf};
 
@@ -13,8 +13,7 @@ pub trait Desktop {
     fn trash(&self, path: &Path) -> Result<(), String>;
     /// Restore the most recently trashed item that was at `path`.
     fn restore(&self, path: &Path) -> Result<(), String>;
-    /// The target of the symlink at `path`. The sandbox never reads an
-    /// absolute one itself, so this asks the host.
+    /// The target of the symlink at `path`.
     fn read_link(&self, path: &Path) -> Option<PathBuf> {
         std::fs::read_link(path).ok()
     }
@@ -25,33 +24,15 @@ pub trait Desktop {
     }
 }
 
-/// The host's `desktop` interface.
+/// The app's `desktop` services.
 pub struct HostDesktop;
 
-#[cfg(target_arch = "wasm32")]
 impl Desktop for HostDesktop {
     fn trash(&self, path: &Path) -> Result<(), String> {
-        sicompass_pdk::desktop::trash(&path.to_string_lossy())
+        sicompass_sdk::plugin::desktop::trash(&path.to_string_lossy())
     }
 
     fn restore(&self, path: &Path) -> Result<(), String> {
-        sicompass_pdk::desktop::restore(&path.to_string_lossy())
-    }
-
-    fn read_link(&self, path: &Path) -> Option<PathBuf> {
-        sicompass_pdk::desktop::read_link(&path.to_string_lossy())
-            .ok()
-            .map(PathBuf::from)
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Desktop for HostDesktop {
-    fn trash(&self, _path: &Path) -> Result<(), String> {
-        Err("no OS trash outside the sandbox".to_owned())
-    }
-
-    fn restore(&self, _path: &Path) -> Result<(), String> {
-        Err("no OS trash outside the sandbox".to_owned())
+        sicompass_sdk::plugin::desktop::restore(&path.to_string_lossy())
     }
 }

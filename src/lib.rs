@@ -1,10 +1,11 @@
 //! The text editor: a file as a list of its lines.
 //!
-//! A sicompass WASM plugin. It asks for the whole disk (`"filesystem": ["/"]`
-//! in `plugin.json`, shown at install), so the sandbox preopens `/` at its real
-//! path. The plugin navigates a filesystem tree rooted at its `textEditorPath`
-//! setting and, when the user enters a file, parses its content into a FFON
-//! tree using the rules in [`parse`]:
+//! A sicompass plugin: a program sicompass starts, with the user's rights. It
+//! declares the whole disk (`"filesystem": ["/"]` in `plugin.json`, shown at
+//! install), and reads and writes it with `std::fs`. The plugin navigates a
+//! filesystem tree rooted at its `textEditorPath` setting and, when the user
+//! enters a file, parses its content into a FFON tree using the rules in
+//! [`parse`]:
 //!
 //! - Lines separated by `\n` are siblings.
 //! - A line ending with `:` becomes a section header (`FfonElement::Obj`).
@@ -17,11 +18,11 @@
 //!
 //! Undo: a line insert or delete is a `ProviderOp` with the line in its
 //! payload, and a file or folder deleted from the directory view carries its
-//! snapshot (`sicompass_sdk::fs_snapshot`), trashed through the host's
-//! `desktop.trash`.
+//! snapshot (`sicompass_sdk::fs_snapshot`), trashed through the app's
+//! `desktop::trash`.
 //!
-//! `textEditorPath` defaults to `~`, which the host expands to the user's home
-//! folder (the sandbox has no environment to find it in).
+//! `textEditorPath` defaults to `~`, which the app expands to the user's home
+//! folder before the plugin sees it.
 
 mod desktop;
 pub mod localize;
@@ -30,9 +31,9 @@ mod parse;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use desktop::{Desktop, HostDesktop};
-use sicompass_pdk::{Descriptor, Plugin, PollResult, ProviderOp, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::fs_snapshot;
+use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult, ProviderOp, host};
 use sicompass_sdk::tags;
 use sicompass_sdk::timeline::FsSideEffect;
 use std::path::{Path, PathBuf};
@@ -70,13 +71,13 @@ pub struct TextEditorProvider {
     /// Populated by `delete_item` (in-file line deletes and file/folder
     /// trashing) so deletions land on the undo timeline.
     pending_timeline_entries: Vec<ProviderOp>,
-    /// The OS trash, through the host (a fake in the tests).
+    /// The OS trash, through the app (a fake in the tests).
     desktop: Box<dyn Desktop>,
 }
 
 impl TextEditorProvider {
     pub fn with_desktop(desktop: Box<dyn Desktop>) -> Self {
-        // Until the setting arrives: the host expands the manifest's `~`.
+        // Until the setting arrives: the app expands the manifest's `~`.
         let text_editor_path = String::new();
         let current_fs_path = PathBuf::from(&text_editor_path);
         let current_path_str = text_editor_path.clone();
@@ -110,7 +111,7 @@ impl TextEditorProvider {
     fn record(&mut self, command: &str, payload: FfonElement, label: String) {
         self.pending_timeline_entries.push(ProviderOp {
             command: command.to_owned(),
-            payload: sicompass_pdk::encode_one(&payload),
+            payload: sicompass_sdk::plugin::encode_one(&payload),
             label,
         });
     }
@@ -149,9 +150,9 @@ impl TextEditorProvider {
         };
     }
 
-    /// `p` through every symlink along it, as the sandbox needs it
-    /// (see `sicompass_sdk::fs_links`). Navigation keeps the path the user
-    /// took; only the filesystem calls see this one.
+    /// `p` through every symlink along it (see `sicompass_sdk::fs_links`).
+    /// Navigation keeps the path the user took; only the filesystem calls see
+    /// this one.
     fn real(&self, p: &Path) -> PathBuf {
         self.desktop.resolve(p)
     }
@@ -165,15 +166,14 @@ impl TextEditorProvider {
     }
 
     fn list_directory(&self, dir: &Path) -> Vec<FfonElement> {
-        // `sicompass_pdk::fs::list_dir`, not `std::fs::read_dir`: inside the
-        // sandbox the latter stops at the first entry another program removed
-        // meanwhile, and loses every entry after it.
+        // An entry that cannot be read, or vanished meanwhile, is left out.
         let dir = self.real(dir);
-        let Ok(names) = sicompass_pdk::fs::list_dir(&dir) else {
+        let Ok(read) = std::fs::read_dir(&dir) else {
             return vec![];
         };
-        let mut entries: Vec<(bool, String)> = names
-            .into_iter()
+        let mut entries: Vec<(bool, String)> = read
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter_map(|name| {
                 // The entry's own type: a link to a folder is not listed as
                 // one, as before.
@@ -324,10 +324,8 @@ impl Plugin for TextEditorProvider {
 
     /// Start where the user's `textEditorPath` setting says.
     fn init(&mut self) {
-        if let Some(val) =
-            sicompass_pdk::host::get_setting("textEditorPath").filter(|s| !s.is_empty())
-        {
-            self.text_editor_path = val;
+        if let Some(val) = host::get_setting("textEditorPath").filter(|s| !s.is_empty()) {
+            self.text_editor_path = expand_home(&val);
         }
         self.current_fs_path = PathBuf::from(&self.text_editor_path);
         self.ffon_sub_path.clear();
@@ -577,7 +575,7 @@ impl Plugin for TextEditorProvider {
     }
 
     fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
-        let Some(payload) = sicompass_pdk::decode_one(&entry.payload) else {
+        let Some(payload) = sicompass_sdk::plugin::decode_one(&entry.payload) else {
             return Ok(());
         };
         match entry.command.as_str() {
@@ -614,7 +612,7 @@ impl Plugin for TextEditorProvider {
     }
 
     fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
-        let Some(payload) = sicompass_pdk::decode_one(&entry.payload) else {
+        let Some(payload) = sicompass_sdk::plugin::decode_one(&entry.payload) else {
             return Ok(());
         };
         match entry.command.as_str() {
@@ -691,9 +689,13 @@ impl Plugin for TextEditorProvider {
     // ---- Settings ----------------------------------------------------------
 
     fn on_setting_change(&mut self, key: &str, value: &str) {
-        if key == "textEditorPath" && value != self.text_editor_path {
-            self.text_editor_path = value.to_string();
-            self.current_fs_path = PathBuf::from(value);
+        if key != "textEditorPath" {
+            return;
+        }
+        let value = expand_home(value);
+        if value != self.text_editor_path {
+            self.current_fs_path = PathBuf::from(&value);
+            self.text_editor_path = value;
             self.ffon_sub_path.clear();
             self.loaded_path = None;
             self.source_lines.clear();
@@ -708,8 +710,6 @@ impl Plugin for TextEditorProvider {
 // Helpers
 // ---------------------------------------------------------------------------
 
-export_plugin!(TextEditorProvider);
-
 impl TextEditorProvider {
     /// Write the lines back, or say why not in the user's language.
     fn flush_or(&mut self, error_id: &str) -> Result<(), String> {
@@ -718,6 +718,24 @@ impl TextEditorProvider {
         } else {
             Err(localize::t(error_id))
         }
+    }
+}
+
+/// `~` or `~/…` as the user's home folder; anything else as it is. The app
+/// expands the setting before the plugin sees it, so this only matters for a
+/// `~` that arrives some other way, which would otherwise name a folder `~`.
+fn expand_home(value: &str) -> String {
+    let rest = match value.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest,
+        _ => return value.to_owned(),
+    };
+    match std::env::home_dir() {
+        Some(home) if rest.is_empty() => home.to_string_lossy().into_owned(),
+        Some(home) => home
+            .join(rest.trim_start_matches(['/', '\\']))
+            .to_string_lossy()
+            .into_owned(),
+        None => value.to_owned(),
     }
 }
 
@@ -807,10 +825,10 @@ mod tests {
         p
     }
 
-    /// Outside the sandbox there is no trash: the host desktop refuses, so a
-    /// native test can only ever reach the fake.
+    /// Outside sicompass there is no app to trash anything: the host desktop
+    /// refuses, so a test can only ever reach the fake.
     #[test]
-    fn natively_the_host_desktop_touches_nothing() {
+    fn outside_sicompass_the_host_desktop_touches_nothing() {
         let dir = make_tmp();
         let file = dir.path().join("x.txt");
         std::fs::write(&file, b"x").unwrap();
@@ -844,7 +862,7 @@ mod tests {
     /// The directory-view delete's snapshot, out of its undo entry.
     fn snapshot_of(entry: &ProviderOp) -> FsSideEffect {
         assert_eq!(entry.command, OP_DELETE);
-        decode_snapshot(&sicompass_pdk::decode_one(&entry.payload).unwrap()).unwrap()
+        decode_snapshot(&sicompass_sdk::plugin::decode_one(&entry.payload).unwrap()).unwrap()
     }
 
     // ---- basic fetch / navigation ------------------------------------------
@@ -903,6 +921,20 @@ mod tests {
         assert!(p.needs_refresh());
         p.clear_needs_refresh();
         assert!(!p.needs_refresh());
+    }
+
+    /// A `~` that reaches the plugin unexpanded is still the home folder, and
+    /// only `~` or `~/…` are: `~user` and other paths are left as they are.
+    #[test]
+    fn a_tilde_path_is_the_home_folder() {
+        let home = std::env::home_dir().expect("a home folder");
+        let mut p = editor();
+        p.on_setting_change("textEditorPath", "~");
+        assert_eq!(PathBuf::from(&p.text_editor_path), home);
+        p.on_setting_change("textEditorPath", "~/notes");
+        assert_eq!(PathBuf::from(&p.text_editor_path), home.join("notes"));
+        assert_eq!(expand_home("~someone/x"), "~someone/x");
+        assert_eq!(expand_home("/srv/~"), "/srv/~");
     }
 
     #[test]
