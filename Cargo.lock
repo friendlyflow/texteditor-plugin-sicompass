@@ -625,9 +625,9 @@ dependencies = [
 
 [[package]]
 name = "sicompass-sdk"
-version = "0.9.1"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87268b7bdc44757a5612bb692d9771ae7d60787ebfedbe969895c8a8329fd00b"
+checksum = "84eae40d208858be4504303f3b3b3d4f5c8e673345d61548d0bca8440ea57173"
 dependencies = [
  "async-trait",
  "libc",
@@ -742,6 +742,7 @@ name = "texteditor-plugin"
 version = "0.3.0"
 dependencies = [
  "base64",
+ "libc",
  "sicompass-sdk",
  "tempfile",
 ]

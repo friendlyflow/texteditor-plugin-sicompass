@@ -73,6 +73,9 @@ pub struct TextEditorProvider {
     pending_timeline_entries: Vec<ProviderOp>,
     /// The OS trash, through the app (a fake in the tests).
     desktop: Box<dyn Desktop>,
+    /// Why the last create, rename, delete or save failed, for the app's
+    /// header (`poll`).
+    error: Option<String>,
 }
 
 impl TextEditorProvider {
@@ -93,7 +96,12 @@ impl TextEditorProvider {
             trailing_newline: false,
             pending_timeline_entries: Vec::new(),
             desktop,
+            error: None,
         }
+    }
+
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 
     pub fn at_root(&self) -> bool {
@@ -246,13 +254,24 @@ impl TextEditorProvider {
     /// subsequent edit that addresses lines by index. Rebuild
     /// `source_lines` from the just-written content so it matches the file.
     fn flush_source_lines(&mut self) -> bool {
+        match self.write_source_lines() {
+            Ok(()) => true,
+            Err(e) => {
+                let name = self.current_fs_path.display().to_string();
+                self.error = Some(failed("texteditor-error-save", &name, &io_reason(&e)));
+                false
+            }
+        }
+    }
+
+    /// [`Self::flush_source_lines`], with the system's error when the file
+    /// cannot be written (a file that needs sudo).
+    fn write_source_lines(&mut self) -> std::io::Result<()> {
         let mut content = self.source_lines.join("\n");
         if self.trailing_newline {
             content.push('\n');
         }
-        if std::fs::write(self.real(&self.current_fs_path), &content).is_err() {
-            return false;
-        }
+        std::fs::write(self.real(&self.current_fs_path), &content)?;
         // Re-derive source_lines from the freshly-written content so each
         // vector slot maps to exactly one file line.
         self.source_lines = content.lines().map(str::to_owned).collect();
@@ -264,7 +283,7 @@ impl TextEditorProvider {
             .unwrap_or("");
         let tree = parse::parse_file_ext(&content, ext);
         self.cached_ffon = wrap_ffon_in_input(tree);
-        true
+        Ok(())
     }
 
     fn rename_fs_item(&mut self, old: &str, new: &str) -> bool {
@@ -274,9 +293,19 @@ impl TextEditorProvider {
             return false;
         }
         let dir = self.real(&self.current_fs_path);
-        let old_path = dir.join(old_name.trim_end_matches('/').trim_end_matches('\\'));
-        let new_path = dir.join(new_name.trim_end_matches('/').trim_end_matches('\\'));
-        std::fs::rename(&old_path, &new_path).is_ok()
+        let old_name = old_name.trim_end_matches('/').trim_end_matches('\\');
+        let new_name = new_name.trim_end_matches('/').trim_end_matches('\\');
+        match std::fs::rename(dir.join(old_name), dir.join(new_name)) {
+            Ok(()) => true,
+            Err(e) => {
+                let mut args = localize::Args::new();
+                args.set("old", old_name);
+                args.set("new", new_name);
+                args.set("err", io_reason(&e));
+                self.error = Some(localize::t_args("texteditor-error-rename", &args));
+                false
+            }
+        }
     }
 }
 
@@ -342,6 +371,7 @@ impl Plugin for TextEditorProvider {
         self.clear_needs_refresh();
         PollResult {
             at_root: self.at_root(),
+            error: self.take_error(),
             needs_refresh,
             structural_edit_here: true,
             dashboard_here: false,
@@ -517,14 +547,31 @@ impl Plugin for TextEditorProvider {
         if name.is_empty() || self.is_in_file_view() {
             return false;
         }
-        std::fs::File::create(self.real(&self.current_fs_path).join(name)).is_ok()
+        // Never over a file of that name: `File::create` would empty it.
+        match std::fs::File::create_new(self.real(&self.current_fs_path).join(name)) {
+            Ok(_) => true,
+            Err(e) => {
+                self.error = Some(failed("texteditor-error-create-file", name, &io_reason(&e)));
+                false
+            }
+        }
     }
 
     fn create_directory(&mut self, name: &str) -> bool {
         if name.is_empty() || self.is_in_file_view() {
             return false;
         }
-        std::fs::create_dir(self.real(&self.current_fs_path).join(name)).is_ok()
+        match std::fs::create_dir(self.real(&self.current_fs_path).join(name)) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(failed(
+                    "texteditor-error-create-directory",
+                    name,
+                    &io_reason(&e),
+                ));
+                false
+            }
+        }
     }
 
     fn delete_item(&mut self, name: &str) -> bool {
@@ -562,12 +609,31 @@ impl Plugin for TextEditorProvider {
         // Snapshot before trashing so an undo can restore even if the OS trash
         // is later emptied (see `sicompass_sdk::fs_snapshot`).
         let side_effect = fs_snapshot::snapshot_for_delete(&full);
-        if self.desktop.trash(&full).is_err() {
+        if let Err(e) = self.desktop.trash(&full) {
+            self.error = Some(failed("texteditor-error-delete", clean, &reason(&e)));
             return false;
         }
         let payload = FfonElement::new_str(B64.encode(fs_snapshot::encode(&side_effect)));
         self.record(OP_DELETE, payload, format!("delete {clean}"));
         true
+    }
+
+    /// A folder or file the user may not write to (one that needs sudo) says
+    /// so before anything is typed, in the words a write there would get.
+    fn cannot_add_here(&mut self) -> Option<String> {
+        if self.text_editor_path.trim().is_empty() {
+            return None;
+        }
+        let at = self.real(&self.current_fs_path);
+        let (key, err) = if self.is_in_file_view() {
+            ("texteditor-error-change-here", may_write(&at, false).err()?)
+        } else {
+            ("texteditor-error-add-here", may_write(&at, true).err()?)
+        };
+        let mut args = localize::Args::new();
+        args.set("path", self.current_fs_path.display());
+        args.set("err", io_reason(&err));
+        Some(localize::t_args(key, &args))
     }
 
     fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
@@ -679,6 +745,11 @@ impl Plugin for TextEditorProvider {
         _elem_key: &str,
         _elem_type: i32,
     ) -> Result<Option<FfonElement>, String> {
+        if matches!(cmd, "create directory" | "create file")
+            && let Some(why) = self.cannot_add_here()
+        {
+            return Err(why);
+        }
         Ok(match cmd {
             "create directory" => Some(FfonElement::new_obj("<input></input>")),
             "create file" => Some(FfonElement::new_str("<input></input>".to_owned())),
@@ -713,12 +784,70 @@ impl Plugin for TextEditorProvider {
 impl TextEditorProvider {
     /// Write the lines back, or say why not in the user's language.
     fn flush_or(&mut self, error_id: &str) -> Result<(), String> {
-        if self.flush_source_lines() {
-            Ok(())
-        } else {
-            Err(localize::t(error_id))
-        }
+        self.write_source_lines().map_err(|_| localize::t(error_id))
     }
+}
+
+/// `key` filled in with the item's `name` and the reason it failed.
+fn failed(key: &str, name: &str, why: &str) -> String {
+    let mut args = localize::Args::new();
+    args.set("name", name);
+    args.set("err", why);
+    localize::t_args(key, &args)
+}
+
+/// Why the system refused, short enough to read out: the user's language for
+/// a missing right (a file or folder that needs sudo), else the system's own
+/// words without their `(os error N)`.
+fn io_reason(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return localize::t("texteditor-error-reason-permission-denied");
+    }
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
+}
+
+/// [`io_reason`] for an error that crossed the app as text (the trash): its
+/// `(os error N)`, when it has one, says which error it was.
+fn reason(text: &str) -> String {
+    let code = text
+        .strip_suffix(')')
+        .and_then(|t| t.rsplit_once("(os error "))
+        .and_then(|(_, n)| n.parse::<i32>().ok());
+    match code {
+        Some(n) => io_reason(&std::io::Error::from_raw_os_error(n)),
+        None => text.to_owned(),
+    }
+}
+
+/// Whether the user may write `path`: a file's contents, or (`dir`) new
+/// entries in a folder, which also takes the right to search it. Judged by
+/// the system as it will judge the write itself.
+#[cfg(unix)]
+fn may_write(path: &Path, dir: bool) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mode = if dir {
+        libc::W_OK | libc::X_OK
+    } else {
+        libc::W_OK
+    };
+    // SAFETY: a valid C string, which `access` only reads.
+    if unsafe { libc::access(c.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere the write itself is the only judge: it says why on Enter.
+#[cfg(not(unix))]
+fn may_write(_path: &Path, _dir: bool) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `~` or `~/…` as the user's home folder; anything else as it is. The app
@@ -881,6 +1010,7 @@ mod tests {
             trailing_newline: false,
             pending_timeline_entries: vec![],
             desktop: Box::new(FakeDesktop::default()),
+            error: None,
         };
         let items = p.fetch();
         assert_eq!(items.len(), 1);
@@ -1123,6 +1253,138 @@ mod tests {
     }
 
     // ---- directory create / delete / rename --------------------------------
+
+    /// A folder the test user cannot write to, as `/etc` is for a user
+    /// without sudo, holding `kept.txt` (itself read-only). `None` when the
+    /// user can write there anyway (root), where the test has nothing to show.
+    #[cfg(unix)]
+    struct ReadOnly(TempDir);
+
+    #[cfg(unix)]
+    impl ReadOnly {
+        fn new() -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = make_tmp();
+            let kept = dir.path().join("kept.txt");
+            std::fs::write(&kept, "alpha\nbeta").unwrap();
+            std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o444)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let ro = ReadOnly(dir);
+            if std::fs::write(ro.0.path().join("probe"), b"").is_ok() {
+                return None;
+            }
+            Some(ro)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0.path(), std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Every change the system refuses says why, in words a screen reader can
+    /// read out, and leaves the disk as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_change_in_a_read_only_folder_says_why() {
+        let Some(ro) = ReadOnly::new() else { return };
+        let mut p = make_text_editor(&ro.0);
+        assert!(!p.create_file("new.txt"));
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not create new.txt: permission denied")
+        );
+        assert!(!p.create_directory("sub"));
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not create folder sub: permission denied")
+        );
+        assert!(!p.commit_edit("<input>kept.txt</input>", "<input>moved.txt</input>"));
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not rename kept.txt to moved.txt: permission denied")
+        );
+        assert!(!p.delete_item("<input>kept.txt</input>"));
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not delete kept.txt: permission denied")
+        );
+        assert!(ro.0.path().join("kept.txt").exists());
+        assert!(p.take_timeline_entries().is_empty());
+    }
+
+    /// Saving a line of a file that needs sudo says why, and the file keeps
+    /// what it had.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_save_says_why() {
+        let Some(ro) = ReadOnly::new() else { return };
+        let mut p = make_text_editor(&ro.0);
+        p.push_path("kept.txt");
+        p.fetch();
+        let old = format!("<input>{}beta</input>", tags::format_src(1));
+        assert!(!p.commit_edit(&old, "BETA"));
+        let file = ro.0.path().join("kept.txt");
+        assert_eq!(
+            p.take_error(),
+            Some(format!(
+                "could not save {}: permission denied",
+                file.display()
+            ))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta");
+    }
+
+    /// Where nothing can be written, the plugin says so before anything is
+    /// typed: in the folder (and its create commands), and in the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_folder_or_file_says_nothing_can_be_added() {
+        let Some(ro) = ReadOnly::new() else { return };
+        let mut p = make_text_editor(&ro.0);
+        let folder = format!("cannot add to {}: permission denied", ro.0.path().display());
+        assert_eq!(p.cannot_add_here().as_deref(), Some(folder.as_str()));
+        for cmd in ["create file", "create directory"] {
+            assert_eq!(p.handle_command(cmd, "", 0), Err(folder.clone()), "{cmd}");
+        }
+        p.push_path("kept.txt");
+        let file = ro.0.path().join("kept.txt");
+        assert_eq!(
+            p.cannot_add_here(),
+            Some(format!(
+                "cannot change {}: permission denied",
+                file.display()
+            ))
+        );
+
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join("open.txt"), "x").unwrap();
+        let mut writable = make_text_editor(&tmp);
+        assert_eq!(writable.cannot_add_here(), None);
+        writable.push_path("open.txt");
+        assert_eq!(writable.cannot_add_here(), None);
+    }
+
+    /// Creating a name that is taken leaves what is there alone.
+    #[test]
+    fn creating_an_existing_file_keeps_its_contents() {
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join("kept.txt"), "precious").unwrap();
+        let mut p = make_text_editor(&tmp);
+        assert!(!p.create_file("kept.txt"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("kept.txt")).unwrap(),
+            "precious"
+        );
+        assert!(
+            p.take_error()
+                .unwrap()
+                .starts_with("could not create kept.txt: ")
+        );
+    }
 
     #[test]
     fn create_file_creates_on_disk() {
