@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- When creating, deleting, renaming or saving fails, it says why.
+- In a folder or file you cannot write to, adding is refused before you type
+  anything.
+- Creating a file never empties a file that already exists.
+
 ## 0.3.0
 
 Text Editor is a program of its own now, instead of a sandboxed WebAssembly component.
