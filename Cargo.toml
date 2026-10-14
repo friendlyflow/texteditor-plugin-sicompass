@@ -22,6 +22,8 @@ path = "src/main.rs"
 sicompass-sdk = { version = "0.9.5", default-features = false, features = ["plugin"] }
 # A delete's snapshot travels in an undo payload, which is FFON text.
 base64 = "0.22"
+# A `.ff` file is a Merkle tree: every node carries a SHA-256 hash.
+sha2 = "0.11"
 
 # Whether a folder or file can be written, asked before a row is opened
 # (`cannot_add_here`). On Windows the write itself says.

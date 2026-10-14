@@ -14,6 +14,22 @@ and can be undone with ctrl+z.
 It starts in the folder set in Settings, under text editor, which is your home
 folder until you change it.
 
+## .ff files
+
+A `.ff` file is not text but a tree of nodes, stored as binary. It opens as
+that tree. A node with children, or one whose text ends in `:`, is a level you
+enter with Right. Every Enter writes the file again, and every change can be
+undone.
+
+Each node holds a SHA-256 hash of its children's hashes followed by the hash
+of its own text, so the file is a Merkle tree and its root hash changes
+whenever anything in it does. On disk a node is its hash (32 bytes), the
+number of its children (one byte), the children themselves, the length of its
+text (one byte) and the text in UTF-8. A file is one root node with empty
+text, so a node holds at most 255 children and 255 bytes of text. A file whose
+hashes do not match still opens, with a warning, and the next save writes
+them right.
+
 The text editor asks for your whole disk, so it can open any file you point it
 at. The Store shows that before you install it, and installing it is your
 approval.

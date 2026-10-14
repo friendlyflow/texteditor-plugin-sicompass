@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Opens, edits and saves `.ff` files, a binary tree of nodes where every node
+  carries a SHA-256 hash of its children and its text (a Merkle tree). A node
+  whose text ends in `:` is a level to enter. Every Enter writes the file, and
+  inserting and deleting nodes can be undone.
+
 ## 0.3.1
 
 - When creating, deleting, renaming or saving fails, it says why.

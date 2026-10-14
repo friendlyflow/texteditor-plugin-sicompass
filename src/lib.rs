@@ -21,10 +21,15 @@
 //! snapshot (`sicompass_sdk::fs_snapshot`), trashed through the app's
 //! `desktop::trash`.
 //!
+//! A `.ff` file is not text but a binary tree of nodes, each hashed over its
+//! children and its content (a Merkle tree, see [`ff`]). It opens as that
+//! tree, and every Enter writes the whole file again.
+//!
 //! `textEditorPath` defaults to `~`, which the app expands to the user's home
 //! folder before the plugin sees it.
 
 mod desktop;
+pub mod ff;
 pub mod localize;
 mod parse;
 
@@ -42,6 +47,9 @@ use std::path::{Path, PathBuf};
 const OP_DELETE_LINE: &str = "texteditor.delete_line";
 const OP_INSERT_LINES: &str = "texteditor.insert_lines";
 const OP_DELETE: &str = "texteditor.delete";
+/// A `.ff` node inserted or deleted, with its subtree in the payload.
+const OP_FF_INSERT: &str = "texteditor.ff_insert";
+const OP_FF_DELETE: &str = "texteditor.ff_delete";
 
 // ---------------------------------------------------------------------------
 // TextEditorProvider
@@ -67,6 +75,11 @@ pub struct TextEditorProvider {
     loaded_path: Option<PathBuf>,
     /// Whether the source file ended with a newline (restored on every flush).
     trailing_newline: bool,
+    /// The open `.ff` file's tree, when the open file is one and it decoded.
+    ff: Option<ff::FfDoc>,
+    /// Where in `ff` the user is: child positions from the root, one per
+    /// `ffon_sub_path` segment.
+    ff_path: Vec<usize>,
     /// Unified-timeline emission queue, drained by the app after each action.
     /// Populated by `delete_item` (in-file line deletes and file/folder
     /// trashing) so deletions land on the undo timeline.
@@ -94,6 +107,8 @@ impl TextEditorProvider {
             cached_ffon: Vec::new(),
             loaded_path: None,
             trailing_newline: false,
+            ff: None,
+            ff_path: Vec::new(),
             pending_timeline_entries: Vec::new(),
             desktop,
             error: None,
@@ -208,6 +223,9 @@ impl TextEditorProvider {
     /// build the annotated `cached_ffon`.  Returns `false` if the file cannot
     /// be read.
     fn load_file(&mut self) -> bool {
+        if self.is_ff_file() {
+            return self.load_ff();
+        }
         let contents = match std::fs::read_to_string(self.real(&self.current_fs_path)) {
             Ok(s) => s,
             Err(_) => return false,
@@ -235,6 +253,13 @@ impl TextEditorProvider {
         if self.loaded_path.as_deref() != Some(self.current_fs_path.as_path()) && !self.load_file()
         {
             return vec![FfonElement::new_str("(binary or unreadable file)")];
+        }
+        if self.is_ff_file() {
+            // A file that did not decode keeps its one explaining row.
+            return match &self.ff {
+                Some(doc) => doc.to_ffon(&self.ff_path),
+                None => self.cached_ffon.clone(),
+            };
         }
         let tree = &self.cached_ffon;
         if self.ffon_sub_path.is_empty() {
@@ -362,6 +387,8 @@ impl Plugin for TextEditorProvider {
         self.loaded_path = None;
         self.source_lines.clear();
         self.cached_ffon.clear();
+        self.ff = None;
+        self.ff_path.clear();
         self.pending_timeline_entries.clear();
         self.sync_path_str();
     }
@@ -394,6 +421,10 @@ impl Plugin for TextEditorProvider {
         let clean = tags::strip_display(segment);
         let clean = clean.trim_end_matches('/');
         if self.real(&self.current_fs_path).is_file() {
+            if self.is_ff_file() {
+                let next = self.ff_child_path(segment, clean);
+                self.ff_path = next;
+            }
             self.ffon_sub_path.push(clean.to_string());
         } else {
             let candidate = self.current_fs_path.join(clean);
@@ -402,6 +433,8 @@ impl Plugin for TextEditorProvider {
                 self.loaded_path = None;
                 self.source_lines.clear();
                 self.cached_ffon.clear();
+                self.ff = None;
+                self.ff_path.clear();
                 self.current_fs_path = candidate;
             }
         }
@@ -411,11 +444,14 @@ impl Plugin for TextEditorProvider {
     fn pop_path(&mut self) {
         if !self.ffon_sub_path.is_empty() {
             self.ffon_sub_path.pop();
+            self.ff_path.pop();
         } else if self.current_fs_path != self.root_path() {
             // Leaving a file — clear the cache.
             self.loaded_path = None;
             self.source_lines.clear();
             self.cached_ffon.clear();
+            self.ff = None;
+            self.ff_path.clear();
             self.current_fs_path.pop();
         }
         self.sync_path_str();
@@ -431,6 +467,8 @@ impl Plugin for TextEditorProvider {
         self.loaded_path = None;
         self.source_lines.clear();
         self.cached_ffon.clear();
+        self.ff = None;
+        self.ff_path.clear();
         self.sync_path_str();
     }
 
@@ -441,6 +479,11 @@ impl Plugin for TextEditorProvider {
         // undo/redo paths where FsRename passes element keys verbatim).
         let old_inner = tags::extract_input(old).unwrap_or_else(|| old.to_owned());
         let new_inner = tags::extract_input(new).unwrap_or_else(|| new.to_owned());
+
+        // A `.ff` file is a tree of nodes, not lines.
+        if self.is_ff_file() {
+            return self.ff_commit_edit(&old_inner, &new_inner);
+        }
 
         // ── Case 1: in-file line REPLACE ────────────────────────────────────
         // old_inner starts with <src=N>: edit the Nth source line.
@@ -577,6 +620,9 @@ impl Plugin for TextEditorProvider {
     fn delete_item(&mut self, name: &str) -> bool {
         // In-file: delete the indicated source line.
         let inner = tags::extract_input(name).unwrap_or_else(|| name.to_owned());
+        if self.is_ff_file() {
+            return self.ff_delete(&inner);
+        }
         if let Some((line_idx, _)) = tags::extract_src(&inner) {
             if line_idx >= self.source_lines.len() {
                 return false;
@@ -673,6 +719,8 @@ impl Plugin for TextEditorProvider {
                 self.source_lines.drain(start..end);
                 self.flush_or("texteditor-error-undo-insert-line-write-failed")
             }
+            OP_FF_INSERT => self.ff_take_back(&payload, "texteditor-error-undo-ff-write-failed"),
+            OP_FF_DELETE => self.ff_put_back(&payload, "texteditor-error-undo-ff-write-failed"),
             _ => Ok(()),
         }
     }
@@ -725,6 +773,8 @@ impl Plugin for TextEditorProvider {
                 self.source_lines.splice(clamp..clamp, lines);
                 self.flush_or("texteditor-error-redo-insert-line-write-failed")
             }
+            OP_FF_INSERT => self.ff_put_back(&payload, "texteditor-error-redo-ff-write-failed"),
+            OP_FF_DELETE => self.ff_take_back(&payload, "texteditor-error-redo-ff-write-failed"),
             _ => Ok(()),
         }
     }
@@ -771,6 +821,8 @@ impl Plugin for TextEditorProvider {
             self.loaded_path = None;
             self.source_lines.clear();
             self.cached_ffon.clear();
+            self.ff = None;
+            self.ff_path.clear();
             self.refresh_pending = true;
             self.sync_path_str();
         }
@@ -786,6 +838,256 @@ impl TextEditorProvider {
     fn flush_or(&mut self, error_id: &str) -> Result<(), String> {
         self.write_source_lines().map_err(|_| localize::t(error_id))
     }
+}
+
+// ---------------------------------------------------------------------------
+// `.ff` files
+// ---------------------------------------------------------------------------
+
+impl TextEditorProvider {
+    /// Whether the open file is a `.ff` tree.
+    fn is_ff_file(&self) -> bool {
+        self.current_fs_path.extension().is_some_and(|e| e == "ff")
+            && self.real(&self.current_fs_path).is_file()
+    }
+
+    /// Read and decode the `.ff` file at `current_fs_path`. One that does not
+    /// decode opens as a single row saying why. One whose hashes do not match
+    /// opens with a warning, and its next save writes them right.
+    fn load_ff(&mut self) -> bool {
+        let Ok(bytes) = std::fs::read(self.real(&self.current_fs_path)) else {
+            return false;
+        };
+        self.loaded_path = Some(self.current_fs_path.clone());
+        self.source_lines.clear();
+        self.cached_ffon.clear();
+        match ff::decode(&bytes) {
+            Ok(root) => {
+                if !root.verify() {
+                    let mut args = localize::Args::new();
+                    args.set("name", self.current_fs_path.display());
+                    self.error = Some(localize::t_args("texteditor-error-ff-hash", &args));
+                }
+                self.ff = Some(ff::FfDoc::new(root));
+            }
+            Err(e) => {
+                self.ff = None;
+                let mut args = localize::Args::new();
+                args.set("err", ff_reason(e));
+                let row = localize::t_args("texteditor-ff-invalid", &args);
+                self.cached_ffon = vec![FfonElement::new_str(row)];
+            }
+        }
+        true
+    }
+
+    /// The path of the node `segment` names, one level below `ff_path`: by
+    /// the `<src=N>` the app passes along, else the first child whose content
+    /// is `clean`. A segment that names nothing still takes a level, so
+    /// `pop_path` stays in step.
+    fn ff_child_path(&mut self, segment: &str, clean: &str) -> Vec<usize> {
+        self.ensure_file_loaded();
+        let mut path = self.ff_path.clone();
+        let Some(doc) = &self.ff else {
+            path.push(usize::MAX);
+            return path;
+        };
+        let inner = tags::extract_input(segment).unwrap_or_else(|| segment.to_owned());
+        if let Some(found) = tags::extract_src(&inner).and_then(|(n, _)| doc.path_of(n))
+            && found.len() == self.ffon_sub_path.len() + 1
+        {
+            return found;
+        }
+        let pos = doc
+            .node_at(&path)
+            .and_then(|p| p.children.iter().position(|c| c.content == clean))
+            .unwrap_or(usize::MAX);
+        path.push(pos);
+        path
+    }
+
+    /// `commit_edit` in a `.ff` file. `old` and `new` are unwrapped from
+    /// their `<input>`.
+    fn ff_commit_edit(&mut self, old: &str, new: &str) -> bool {
+        self.ensure_file_loaded();
+        let Some(doc) = self.ff.as_mut() else {
+            return false;
+        };
+
+        // Node N's content, or (an undo of an insert, `<srcins>` in `new`)
+        // node N taken back out.
+        if let Some((n, _)) = tags::extract_src(old) {
+            if tags::extract_src_insert(new).is_some() {
+                return doc.delete(n).is_some() && self.write_ff();
+            }
+            let text = tags::strip_display(new);
+            return match doc.replace(n, &text) {
+                Ok(true) => self.write_ff(),
+                Ok(false) => true,
+                Err(e) => self.ff_refuse(e),
+            };
+        }
+
+        // A new node: at `<srcins=M>` (Ctrl+I, Ctrl+A), or after the last
+        // child for the `i` placeholder of an empty level (an empty `old`).
+        let text = tags::strip_display(new);
+        let pos = match tags::extract_src_insert(old) {
+            Some(m) => doc.srcins_position(&self.ff_path, m),
+            None if old.is_empty() && !text.is_empty() => {
+                doc.node_at(&self.ff_path).map(|p| p.children.len())
+            }
+            None => None,
+        };
+        let Some(pos) = pos else {
+            return false;
+        };
+        let parent = self.ff_path.clone();
+        let node = ff::Node::new(text);
+        if let Err(e) = doc.insert(&parent, pos, node.clone()) {
+            return self.ff_refuse(e);
+        }
+        if !self.write_ff() {
+            return false;
+        }
+        self.record_ff(OP_FF_INSERT, &parent, pos, &node, "insert node");
+        true
+    }
+
+    /// `delete_item` in a `.ff` file: node N with its subtree.
+    fn ff_delete(&mut self, inner: &str) -> bool {
+        self.ensure_file_loaded();
+        let Some((n, _)) = tags::extract_src(inner) else {
+            return false;
+        };
+        let Some((parent, pos, node)) = self.ff.as_mut().and_then(|doc| doc.delete(n)) else {
+            return false;
+        };
+        if !self.write_ff() {
+            return false;
+        }
+        self.record_ff(OP_FF_DELETE, &parent, pos, &node, "delete node");
+        true
+    }
+
+    /// Say why the tree refused a change (a node's limits).
+    fn ff_refuse(&mut self, e: ff::FfError) -> bool {
+        self.error = Some(ff_reason(e));
+        false
+    }
+
+    /// Queue an insert or delete of `node` at `pos` under `parent`, the
+    /// subtree in the payload so both directions can be replayed.
+    fn record_ff(
+        &mut self,
+        command: &str,
+        parent: &[usize],
+        pos: usize,
+        node: &ff::Node,
+        label: &str,
+    ) {
+        let Ok(bytes) = ff::encode(node) else {
+            return;
+        };
+        let path: Vec<String> = parent.iter().map(usize::to_string).collect();
+        let text = format!("{};{pos};{}", path.join("."), B64.encode(bytes));
+        self.record(command, FfonElement::new_str(text), label.to_owned());
+    }
+
+    /// Undo an insert, or redo a delete: the recorded node comes back out.
+    fn ff_take_back(&mut self, payload: &FfonElement, error_id: &str) -> Result<(), String> {
+        let Some((parent, pos, _)) = decode_ff_payload(payload) else {
+            return Ok(());
+        };
+        self.ensure_file_loaded();
+        let Some(doc) = self.ff.as_mut() else {
+            return Err(localize::t(error_id));
+        };
+        if doc.remove(&parent, pos).is_none() {
+            return Ok(());
+        }
+        self.try_write_ff().map_err(|_| localize::t(error_id))
+    }
+
+    /// Undo a delete, or redo an insert: the recorded node goes back in.
+    fn ff_put_back(&mut self, payload: &FfonElement, error_id: &str) -> Result<(), String> {
+        let Some((parent, pos, node)) = decode_ff_payload(payload) else {
+            return Ok(());
+        };
+        self.ensure_file_loaded();
+        let Some(doc) = self.ff.as_mut() else {
+            return Err(localize::t(error_id));
+        };
+        doc.insert(&parent, pos, node)
+            .map_err(|_| localize::t(error_id))?;
+        self.try_write_ff().map_err(|_| localize::t(error_id))
+    }
+
+    /// Write the tree to the open `.ff` file, or say why not.
+    fn write_ff(&mut self) -> bool {
+        match self.try_write_ff() {
+            Ok(()) => true,
+            Err(e) => {
+                let name = self.current_fs_path.display().to_string();
+                self.error = Some(failed("texteditor-error-save", &name, &io_reason(&e)));
+                false
+            }
+        }
+    }
+
+    /// The bytes go to a file beside it first, which then replaces it, so a
+    /// crash mid-write never leaves half a tree. Where no file can be made
+    /// beside it (a folder the user may not write to), they go in place.
+    fn try_write_ff(&self) -> std::io::Result<()> {
+        let Some(doc) = &self.ff else {
+            return Err(std::io::Error::other("no .ff file is open"));
+        };
+        let bytes = ff::encode(&doc.root).map_err(|e| std::io::Error::other(ff_reason(e)))?;
+        let path = self.real(&self.current_fs_path);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(path.file_name().unwrap_or_default());
+        tmp_name.push(".tmp");
+        let tmp = path.with_file_name(tmp_name);
+        if std::fs::write(&tmp, &bytes).is_err() {
+            return std::fs::write(&path, &bytes);
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+}
+
+/// Why a `.ff` file or change was refused, in the user's language.
+fn ff_reason(e: ff::FfError) -> String {
+    localize::t(match e {
+        ff::FfError::Truncated => "texteditor-ff-reason-truncated",
+        ff::FfError::TrailingBytes => "texteditor-ff-reason-trailing",
+        ff::FfError::InvalidUtf8 => "texteditor-ff-reason-utf8",
+        ff::FfError::TooDeep => "texteditor-ff-reason-too-deep",
+        ff::FfError::NoSuchNode => "texteditor-ff-reason-no-node",
+        ff::FfError::TooManyChildren => "texteditor-error-ff-too-many",
+        ff::FfError::ContentTooLong => "texteditor-error-ff-too-long",
+    })
+}
+
+/// A `texteditor.ff_insert` / `texteditor.ff_delete` payload: the parent's
+/// path (child positions joined by `.`), the position, and the subtree as
+/// base64 `.ff` bytes, separated by `;`.
+fn decode_ff_payload(payload: &FfonElement) -> Option<(Vec<usize>, usize, ff::Node)> {
+    let mut parts = payload.as_str()?.splitn(3, ';');
+    let path = parts.next()?;
+    let parent = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('.')
+            .map(|p| p.parse().ok())
+            .collect::<Option<Vec<usize>>>()?
+    };
+    let pos = parts.next()?.parse().ok()?;
+    let node = ff::decode(&B64.decode(parts.next()?).ok()?).ok()?;
+    Some((parent, pos, node))
 }
 
 /// `key` filled in with the item's `name` and the reason it failed.
@@ -1008,6 +1310,8 @@ mod tests {
             cached_ffon: vec![],
             loaded_path: None,
             trailing_newline: false,
+            ff: None,
+            ff_path: vec![],
             pending_timeline_entries: vec![],
             desktop: Box::new(FakeDesktop::default()),
             error: None,
@@ -2094,6 +2398,244 @@ mod tests {
         }
         assert!(err.is_empty(), "redo error: {err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+    }
+
+    // ---- .ff files ---------------------------------------------------------
+
+    fn ff_leaf(content: &str) -> ff::Node {
+        ff::Node::new(content)
+    }
+
+    fn ff_branch(content: &str, children: Vec<ff::Node>) -> ff::Node {
+        let mut node = ff::Node::new(content);
+        node.children = children;
+        node.rehash();
+        node
+    }
+
+    /// `a`, `b:` holding `c` and `d`, then `e` (pre-order 0 to 4).
+    fn ff_sample() -> ff::Node {
+        ff_branch(
+            "",
+            vec![
+                ff_leaf("a"),
+                ff_branch("b:", vec![ff_leaf("c"), ff_leaf("d")]),
+                ff_leaf("e"),
+            ],
+        )
+    }
+
+    fn read_ff(path: &Path) -> ff::Node {
+        let root = ff::decode(&std::fs::read(path).unwrap()).unwrap();
+        assert!(root.verify(), "every hash on disk is the right one");
+        root
+    }
+
+    fn top_contents(root: &ff::Node) -> Vec<&str> {
+        root.children.iter().map(|c| c.content.as_str()).collect()
+    }
+
+    /// An editor open on `notes.ff` holding `root`.
+    fn open_ff(tmp: &TempDir, root: &ff::Node) -> (TextEditorProvider, PathBuf) {
+        let file = tmp.path().join("notes.ff");
+        std::fs::write(&file, ff::encode(root).unwrap()).unwrap();
+        let mut p = make_text_editor(tmp);
+        p.push_path("notes.ff");
+        p.fetch();
+        (p, file)
+    }
+
+    #[test]
+    fn ff_empty_file_opens_and_every_enter_writes_the_tree() {
+        let tmp = make_tmp();
+        let file = tmp.path().join("notes.ff");
+        std::fs::write(&file, b"").unwrap();
+        let mut p = make_text_editor(&tmp);
+        p.push_path("notes.ff");
+        assert!(p.fetch().is_empty(), "an empty file is an empty root");
+
+        // The `i` placeholder of the empty level.
+        assert!(p.commit_edit("", "hello"));
+        let first = read_ff(&file);
+        assert_eq!(top_contents(&first), ["hello"]);
+        assert_eq!(first.children[0].hash, ff::Node::new("hello").hash);
+        assert_eq!(
+            p.fetch(),
+            [FfonElement::new_str("<input><src=0>hello</input>")]
+        );
+
+        assert!(p.commit_edit("<input><src=0>hello</input>", "world"));
+        let second = read_ff(&file);
+        assert_eq!(top_contents(&second), ["world"]);
+        assert_ne!(
+            second.hash, first.hash,
+            "the root hash follows every change"
+        );
+    }
+
+    #[test]
+    fn ff_trailing_colon_makes_a_branch_to_enter_and_fill() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_branch("", vec![ff_leaf("x")]));
+
+        assert!(p.commit_edit("<input><src=0>x</input>", "groceries:"));
+        let top = p.fetch();
+        let obj = top[0].as_obj().expect("a trailing : is a branch");
+        assert_eq!(obj.key, "<input><src=0>groceries:</input>");
+
+        // Right: the app passes the element's input, `<src=N>` and all.
+        p.push_path("<src=0>groceries:");
+        assert!(p.fetch().is_empty());
+        assert!(p.commit_edit("", "milk"));
+        assert_eq!(
+            p.fetch(),
+            [FfonElement::new_str("<input><src=1>milk</input>")]
+        );
+        assert!(p.commit_edit("<input><srcins=2></input>", "bread"));
+        assert_eq!(
+            p.fetch(),
+            [
+                FfonElement::new_str("<input><src=1>milk</input>"),
+                FfonElement::new_str("<input><src=2>bread</input>"),
+            ]
+        );
+
+        let root = read_ff(&file);
+        assert_eq!(top_contents(&root.children[0]), ["milk", "bread"]);
+
+        p.pop_path();
+        let top = p.fetch();
+        assert_eq!(top[0].as_obj().unwrap().children.len(), 2);
+    }
+
+    #[test]
+    fn ff_insert_after_a_node_with_children_lands_beside_it() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        // Ctrl+A on `b:` (node 1) asks for <srcins=2>, which is `c`, inside it.
+        assert!(p.commit_edit("<input><srcins=2></input>", "x"));
+        assert_eq!(top_contents(&read_ff(&file)), ["a", "b:", "x", "e"]);
+        // Ctrl+I on `a`.
+        assert!(p.commit_edit("<input><srcins=0></input>", "first"));
+        assert_eq!(
+            top_contents(&read_ff(&file)),
+            ["first", "a", "b:", "x", "e"]
+        );
+    }
+
+    #[test]
+    fn ff_edits_inside_a_branch_address_the_whole_tree() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        p.push_path("<src=1>b:");
+        assert_eq!(
+            p.fetch(),
+            [
+                FfonElement::new_str("<input><src=2>c</input>"),
+                FfonElement::new_str("<input><src=3>d</input>"),
+            ]
+        );
+        assert!(p.commit_edit("<input><src=3>d</input>", "D"));
+        let root = read_ff(&file);
+        assert_eq!(top_contents(&root.children[1]), ["c", "D"]);
+        assert_eq!(top_contents(&root), ["a", "b:", "e"]);
+    }
+
+    #[test]
+    fn ff_a_newline_stays_inside_one_node() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        assert!(p.commit_edit("<input><src=0>a</input>", "two\nlines"));
+        assert_eq!(top_contents(&read_ff(&file)), ["two\nlines", "b:", "e"]);
+    }
+
+    #[test]
+    fn ff_delete_takes_the_subtree_and_undo_redo_replay_it() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        let original = std::fs::read(&file).unwrap();
+
+        assert!(p.delete_item("<input><src=1>b:</input>"));
+        let deleted = std::fs::read(&file).unwrap();
+        assert_eq!(top_contents(&read_ff(&file)), ["a", "e"]);
+
+        let entries = p.take_timeline_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(p.undo(&entries[0]), Ok(()));
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert_eq!(p.redo(&entries[0]), Ok(()));
+        assert_eq!(std::fs::read(&file).unwrap(), deleted);
+    }
+
+    #[test]
+    fn ff_insert_undo_redo_replay_it() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        let original = std::fs::read(&file).unwrap();
+
+        assert!(p.commit_edit("<input><srcins=2></input>", "x"));
+        let inserted = std::fs::read(&file).unwrap();
+        let entries = p.take_timeline_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(p.undo(&entries[0]), Ok(()));
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert_eq!(p.redo(&entries[0]), Ok(()));
+        assert_eq!(std::fs::read(&file).unwrap(), inserted);
+    }
+
+    #[test]
+    fn ff_undo_of_an_insert_through_commit_edit_removes_that_node() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        assert!(p.commit_edit("<input><srcins=2></input>", "x"));
+        // `x` is node 4 now: after b's two children.
+        assert!(p.commit_edit("<input><src=4>x</input>", "<input><srcins=2></input>"));
+        assert_eq!(top_contents(&read_ff(&file)), ["a", "b:", "e"]);
+    }
+
+    #[test]
+    fn ff_more_than_255_bytes_is_refused_and_said() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        let before = std::fs::read(&file).unwrap();
+        assert!(!p.commit_edit("<input><src=0>a</input>", &"x".repeat(256)));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        let error = p.poll().error.expect("the header says why");
+        assert!(error.contains("255"), "{error}");
+        assert!(p.commit_edit("<input><src=0>a</input>", &"x".repeat(255)));
+    }
+
+    #[test]
+    fn ff_a_damaged_file_opens_as_one_row_saying_why() {
+        let tmp = make_tmp();
+        let file = tmp.path().join("notes.ff");
+        let bytes = ff::encode(&ff_sample()).unwrap();
+        std::fs::write(&file, &bytes[..bytes.len() - 3]).unwrap();
+        let mut p = make_text_editor(&tmp);
+        p.push_path("notes.ff");
+        let rows = p.fetch();
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_str().unwrap();
+        assert!(row.contains("not a valid .ff file"), "{row}");
+        assert!(!p.commit_edit("", "anything"), "nothing to write into");
+        assert_eq!(std::fs::read(&file).unwrap(), &bytes[..bytes.len() - 3]);
+    }
+
+    #[test]
+    fn ff_a_wrong_hash_opens_with_a_warning_and_saving_mends_it() {
+        let tmp = make_tmp();
+        let file = tmp.path().join("notes.ff");
+        let mut bytes = ff::encode(&ff_sample()).unwrap();
+        bytes[0] ^= 1; // the root's hash
+        std::fs::write(&file, &bytes).unwrap();
+        let mut p = make_text_editor(&tmp);
+        p.push_path("notes.ff");
+        assert_eq!(p.fetch().len(), 3);
+        let error = p.poll().error.expect("a warning");
+        assert!(error.contains("hashes do not match"), "{error}");
+
+        assert!(p.commit_edit("<input><src=0>a</input>", "A"));
+        read_ff(&file); // verifies
     }
 }
 
