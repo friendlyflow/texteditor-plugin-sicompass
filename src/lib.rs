@@ -51,6 +51,10 @@ const OP_DELETE: &str = "texteditor.delete";
 const OP_FF_INSERT: &str = "texteditor.ff_insert";
 const OP_FF_DELETE: &str = "texteditor.ff_delete";
 
+/// The `ff_path` step into a level's `header` row, which is rendered, not a
+/// node. Like any position no node has, the tree finds nothing there.
+const FF_HEADER: usize = usize::MAX - 1;
+
 // ---------------------------------------------------------------------------
 // TextEditorProvider
 // ---------------------------------------------------------------------------
@@ -257,7 +261,7 @@ impl TextEditorProvider {
         if self.is_ff_file() {
             // A file that did not decode keeps its one explaining row.
             return match &self.ff {
-                Some(doc) => doc.to_ffon(&self.ff_path),
+                Some(_) => self.ff_level(),
                 None => self.cached_ffon.clone(),
             };
         }
@@ -893,6 +897,11 @@ impl TextEditorProvider {
             return path;
         };
         let inner = tags::extract_input(segment).unwrap_or_else(|| segment.to_owned());
+        // The header row has no `<src=N>`: every node does.
+        if tags::extract_src(&inner).is_none() && clean == localize::t("texteditor-ff-header") {
+            path.push(FF_HEADER);
+            return path;
+        }
         if let Some(found) = tags::extract_src(&inner).and_then(|(n, _)| doc.path_of(n))
             && found.len() == self.ffon_sub_path.len() + 1
         {
@@ -904,6 +913,31 @@ impl TextEditorProvider {
             .unwrap_or(usize::MAX);
         path.push(pos);
         path
+    }
+
+    /// The rows of the level at `ff_path`. Every level opens with a `header`
+    /// row, the nested ones the app already holds included. Inside it is the
+    /// hash of the node whose children the level shows: at the top, the root
+    /// hash, which changes whenever anything in the file does.
+    fn ff_level(&self) -> Vec<FfonElement> {
+        let Some(doc) = &self.ff else {
+            return Vec::new();
+        };
+        if let Some((&FF_HEADER, owner)) = self.ff_path.split_last() {
+            let Some(hash) = doc.hash_hex(owner) else {
+                return Vec::new();
+            };
+            let mut args = localize::Args::new();
+            args.set("hash", hash);
+            return vec![FfonElement::new_str(localize::t_args(
+                "texteditor-ff-sha256",
+                &args,
+            ))];
+        }
+        with_headers(
+            doc.to_ffon(&self.ff_path),
+            &localize::t("texteditor-ff-header"),
+        )
     }
 
     /// `commit_edit` in a `.ff` file. `old` and `new` are unwrapped from
@@ -1057,6 +1091,22 @@ impl TextEditorProvider {
             let _ = std::fs::remove_file(&tmp);
         })
     }
+}
+
+/// `elements`, and the children of every branch among them, each led by a
+/// childless `header` Obj. Childless, so the app fetches it every time it is
+/// opened and the hash it shows is never one from before the last edit.
+fn with_headers(elements: Vec<FfonElement>, header: &str) -> Vec<FfonElement> {
+    let mut out = Vec::with_capacity(elements.len() + 1);
+    out.push(FfonElement::new_obj(header));
+    out.extend(elements.into_iter().map(|elem| match elem {
+        FfonElement::Obj(mut obj) => {
+            obj.children = with_headers(std::mem::take(&mut obj.children), header);
+            FfonElement::Obj(obj)
+        }
+        leaf => leaf,
+    }));
+    out
 }
 
 /// Why a `.ff` file or change was refused, in the user's language.
@@ -2435,6 +2485,11 @@ mod tests {
         root.children.iter().map(|c| c.content.as_str()).collect()
     }
 
+    /// The row every `.ff` level opens with.
+    fn ff_header() -> FfonElement {
+        FfonElement::new_obj("header")
+    }
+
     /// An editor open on `notes.ff` holding `root`.
     fn open_ff(tmp: &TempDir, root: &ff::Node) -> (TextEditorProvider, PathBuf) {
         let file = tmp.path().join("notes.ff");
@@ -2452,7 +2507,11 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         let mut p = make_text_editor(&tmp);
         p.push_path("notes.ff");
-        assert!(p.fetch().is_empty(), "an empty file is an empty root");
+        assert_eq!(
+            p.fetch(),
+            [ff_header()],
+            "an empty file is an empty root, under its header"
+        );
 
         // The `i` placeholder of the empty level.
         assert!(p.commit_edit("", "hello"));
@@ -2461,7 +2520,10 @@ mod tests {
         assert_eq!(first.children[0].hash, ff::Node::new("hello").hash);
         assert_eq!(
             p.fetch(),
-            [FfonElement::new_str("<input><src=0>hello</input>")]
+            [
+                ff_header(),
+                FfonElement::new_str("<input><src=0>hello</input>")
+            ]
         );
 
         assert!(p.commit_edit("<input><src=0>hello</input>", "world"));
@@ -2480,21 +2542,25 @@ mod tests {
 
         assert!(p.commit_edit("<input><src=0>x</input>", "groceries:"));
         let top = p.fetch();
-        let obj = top[0].as_obj().expect("a trailing : is a branch");
+        let obj = top[1].as_obj().expect("a trailing : is a branch");
         assert_eq!(obj.key, "<input><src=0>groceries:</input>");
 
         // Right: the app passes the element's input, `<src=N>` and all.
         p.push_path("<src=0>groceries:");
-        assert!(p.fetch().is_empty());
+        assert_eq!(p.fetch(), [ff_header()]);
         assert!(p.commit_edit("", "milk"));
         assert_eq!(
             p.fetch(),
-            [FfonElement::new_str("<input><src=1>milk</input>")]
+            [
+                ff_header(),
+                FfonElement::new_str("<input><src=1>milk</input>")
+            ]
         );
         assert!(p.commit_edit("<input><srcins=2></input>", "bread"));
         assert_eq!(
             p.fetch(),
             [
+                ff_header(),
                 FfonElement::new_str("<input><src=1>milk</input>"),
                 FfonElement::new_str("<input><src=2>bread</input>"),
             ]
@@ -2505,7 +2571,15 @@ mod tests {
 
         p.pop_path();
         let top = p.fetch();
-        assert_eq!(top[0].as_obj().unwrap().children.len(), 2);
+        assert_eq!(
+            top[1].as_obj().unwrap().children,
+            [
+                ff_header(),
+                FfonElement::new_str("<input><src=1>milk</input>"),
+                FfonElement::new_str("<input><src=2>bread</input>"),
+            ],
+            "a branch the app holds opens with its header too"
+        );
     }
 
     #[test]
@@ -2531,6 +2605,7 @@ mod tests {
         assert_eq!(
             p.fetch(),
             [
+                ff_header(),
                 FfonElement::new_str("<input><src=2>c</input>"),
                 FfonElement::new_str("<input><src=3>d</input>"),
             ]
@@ -2630,12 +2705,78 @@ mod tests {
         std::fs::write(&file, &bytes).unwrap();
         let mut p = make_text_editor(&tmp);
         p.push_path("notes.ff");
-        assert_eq!(p.fetch().len(), 3);
+        assert_eq!(p.fetch().len(), 4, "the header and three nodes");
         let error = p.poll().error.expect("a warning");
         assert!(error.contains("hashes do not match"), "{error}");
 
         assert!(p.commit_edit("<input><src=0>a</input>", "A"));
         read_ff(&file); // verifies
+    }
+
+    fn sha256_row(hash: &[u8; 32]) -> FfonElement {
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        FfonElement::new_str(format!("sha256: {hex}"))
+    }
+
+    #[test]
+    fn ff_the_top_header_holds_the_root_hash_and_follows_every_edit() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        p.push_path("header");
+        assert_eq!(p.fetch(), [sha256_row(&ff_sample().hash)]);
+        p.pop_path();
+
+        // An edit deep down changes the hash the top header shows.
+        p.push_path("<src=1>b:");
+        assert!(p.commit_edit("<input><src=3>d</input>", "D"));
+        p.pop_path();
+        p.push_path("header");
+        let root = read_ff(&file);
+        assert_ne!(root.hash, ff_sample().hash);
+        assert_eq!(p.fetch(), [sha256_row(&root.hash)]);
+    }
+
+    #[test]
+    fn ff_a_nested_header_holds_the_hash_of_its_node() {
+        let tmp = make_tmp();
+        let (mut p, _file) = open_ff(&tmp, &ff_sample());
+        p.push_path("<src=1>b:");
+        p.push_path("header");
+        assert_eq!(p.fetch(), [sha256_row(&ff_sample().children[1].hash)]);
+        // Nothing can be added inside a header.
+        assert!(!p.commit_edit("", "x"));
+        p.pop_path();
+        assert_eq!(
+            p.fetch().len(),
+            3,
+            "back in b: with its header and two nodes"
+        );
+    }
+
+    #[test]
+    fn ff_a_node_called_header_is_still_a_node() {
+        let tmp = make_tmp();
+        let root = ff_branch("", vec![ff_branch("header", vec![ff_leaf("inside")])]);
+        let (mut p, _file) = open_ff(&tmp, &root);
+        // A node's input carries its `<src=N>`. The header row's does not.
+        p.push_path("<src=0>header");
+        assert_eq!(
+            p.fetch(),
+            [
+                ff_header(),
+                FfonElement::new_str("<input><src=1>inside</input>")
+            ]
+        );
+    }
+
+    #[test]
+    fn ff_the_header_row_cannot_be_edited_or_deleted() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_ff(&tmp, &ff_sample());
+        let before = std::fs::read(&file).unwrap();
+        assert!(!p.commit_edit("header", "renamed"));
+        assert!(!p.delete_item("header"));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 }
 

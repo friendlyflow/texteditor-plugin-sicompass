@@ -23,7 +23,9 @@ undone.
 
 Each node holds a SHA-256 hash of its children's hashes followed by the hash
 of its own text, so the file is a Merkle tree and its root hash changes
-whenever anything in it does. On disk a node is its hash (32 bytes), the
+whenever anything in it does. Every level opens with a header row, and
+Right on it shows the hash of the node whose children the level holds. At the
+top that is the root hash of the whole file. On disk a node is its hash (32 bytes), the
 number of its children (one byte), the children themselves, the length of its
 text (one byte) and the text in UTF-8. A file is one root node with empty
 text, so a node holds at most 255 children and 255 bytes of text. A file whose

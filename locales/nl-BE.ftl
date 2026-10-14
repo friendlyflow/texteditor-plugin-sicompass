@@ -18,6 +18,10 @@ texteditor-error-change-here = kan { $path } niet wijzigen: { $err }
 texteditor-error-reason-permission-denied = geen toestemming
 
 # A .ff file: a tree of nodes, each hashed over its children and its text.
+# Every level of a .ff file opens with this row. Inside it: the hash of the
+# node whose children the level shows.
+texteditor-ff-header = kop
+texteditor-ff-sha256 = sha256: { $hash }
 texteditor-ff-invalid = (geen geldig .ff-bestand: { $err })
 texteditor-ff-reason-truncated = het stopt midden in een knoop
 texteditor-ff-reason-trailing = er staan bytes na de wortelknoop

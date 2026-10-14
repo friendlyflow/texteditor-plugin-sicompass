@@ -281,6 +281,13 @@ impl FfDoc {
         out
     }
 
+    /// The hash of the node at `path` (`[]` is the root, the file's Merkle
+    /// root), as lowercase hex.
+    pub fn hash_hex(&self, path: &[usize]) -> Option<String> {
+        let node = self.node_at(path)?;
+        Some(node.hash.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     /// Set node `n`'s content. `Ok(false)` when it already had it.
     pub fn replace(&mut self, n: usize, text: &str) -> Result<bool, FfError> {
         check_content(text)?;

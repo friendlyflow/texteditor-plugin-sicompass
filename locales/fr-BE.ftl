@@ -18,6 +18,10 @@ texteditor-error-change-here = impossible de modifier { $path } : { $err }
 texteditor-error-reason-permission-denied = permission refusée
 
 # A .ff file: a tree of nodes, each hashed over its children and its text.
+# Every level of a .ff file opens with this row. Inside it: the hash of the
+# node whose children the level shows.
+texteditor-ff-header = en-tête
+texteditor-ff-sha256 = sha256 : { $hash }
 texteditor-ff-invalid = (fichier .ff non valide : { $err })
 texteditor-ff-reason-truncated = il s'arrête au milieu d'un nœud
 texteditor-ff-reason-trailing = il reste des octets après son nœud racine

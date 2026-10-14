@@ -6,6 +6,8 @@
   carries a SHA-256 hash of its children and its text (a Merkle tree). A node
   whose text ends in `:` is a level to enter. Every Enter writes the file, and
   inserting and deleting nodes can be undone.
+- Every level of a `.ff` file opens with a header row holding the hash of the
+  node it lists, the root hash at the top.
 
 ## 0.3.1
 
