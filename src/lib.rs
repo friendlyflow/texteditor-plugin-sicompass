@@ -466,7 +466,24 @@ impl Plugin for TextEditorProvider {
     }
 
     fn set_current_path(&mut self, path: &str) {
-        self.current_fs_path = PathBuf::from(path);
+        // A path can run past a file into the levels inside it
+        // (`…/notes.ff/b:/d:`), which are not on disk. The app restores a tab
+        // by setting its saved path a level at a time, and taking the whole of
+        // it for a folder listed nothing there: the tab reopened at the top of
+        // the file. Open the file, then step into each level as `Right` does.
+        let mut file = PathBuf::from(path);
+        let mut inside = Vec::new();
+        while !self.real(&file).is_file() {
+            let Some(name) = file.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                break;
+            };
+            inside.push(name);
+            if !file.pop() {
+                break;
+            }
+        }
+        let in_file = !inside.is_empty() && self.real(&file).is_file();
+        self.current_fs_path = if in_file { file } else { PathBuf::from(path) };
         self.ffon_sub_path.clear();
         self.loaded_path = None;
         self.source_lines.clear();
@@ -474,6 +491,11 @@ impl Plugin for TextEditorProvider {
         self.ff = None;
         self.ff_path.clear();
         self.sync_path_str();
+        if in_file {
+            for segment in inside.iter().rev() {
+                self.push_path(segment);
+            }
+        }
     }
 
     // ---- Editing -----------------------------------------------------------
@@ -2498,6 +2520,54 @@ mod tests {
         p.push_path("notes.ff");
         p.fetch();
         (p, file)
+    }
+
+    /// The app restores a tab by setting its saved path, one level at a time.
+    /// A path into a file runs past the file into its levels, which are not on
+    /// disk: the editor took the whole of it for a folder that does not exist,
+    /// the levels came back empty, and the tab reopened at the top of the file.
+    #[test]
+    fn ff_a_path_into_a_file_opens_the_levels_inside_it() {
+        let tmp = make_tmp();
+        let root = ff_branch(
+            "",
+            vec![
+                ff_leaf("a"),
+                ff_branch("b:", vec![ff_leaf("c"), ff_branch("d:", vec![ff_leaf("deep")])]),
+            ],
+        );
+        let (mut p, _file) = open_ff(&tmp, &root);
+        p.push_path("b:");
+        p.push_path("d:");
+        let path = p.current_path().to_owned();
+        let rows = p.fetch();
+        assert!(format!("{rows:?}").contains("deep"), "{rows:?}");
+
+        let mut restored = make_text_editor(&tmp);
+        restored.set_current_path(&path);
+        assert_eq!(restored.current_path(), path);
+        assert_eq!(restored.fetch(), rows);
+        restored.pop_path();
+        p.pop_path();
+        assert_eq!(restored.fetch(), p.fetch(), "one level up is `b:`");
+    }
+
+    /// [`ff_a_path_into_a_file_opens_the_levels_inside_it`] for a text file.
+    #[test]
+    fn a_path_into_a_text_file_opens_the_level_inside_it() {
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join("data.txt"), "section:\n{\n  child\n}").unwrap();
+        let mut p = make_text_editor(&tmp);
+        p.push_path("data.txt");
+        p.push_path("section:");
+        let path = p.current_path().to_owned();
+        let rows = p.fetch();
+        assert!(!rows.is_empty());
+
+        let mut restored = make_text_editor(&tmp);
+        restored.set_current_path(&path);
+        assert_eq!(restored.current_path(), path);
+        assert_eq!(restored.fetch(), rows);
     }
 
     #[test]
