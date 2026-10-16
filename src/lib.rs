@@ -64,7 +64,7 @@ pub struct TextEditorProvider {
     text_editor_path: String,
     /// Current filesystem position (rooted at `text_editor_path`).
     current_fs_path: PathBuf,
-    /// Path within a file's parsed FFON tree (non-empty when inside a file).
+    /// Levels entered inside a `.ff` file (a text file has none).
     ffon_sub_path: Vec<String>,
     /// Set to `true` when `text_editor_path` changes so the app re-fetches the FFON.
     refresh_pending: bool,
@@ -72,7 +72,7 @@ pub struct TextEditorProvider {
     current_path_str: String,
     /// Raw source lines of the currently-open file (verbatim, with indentation).
     source_lines: Vec<String>,
-    /// Parsed FFON tree for the current file, with `<src=N>` annotations and
+    /// The current file's rows, one per line, with `<src=N>` annotations and
     /// `<input>` wrappers so every line is editable.
     cached_ffon: Vec<FfonElement>,
     /// Which file produced the current cache (avoids re-reading on every fetch).
@@ -234,20 +234,13 @@ impl TextEditorProvider {
             Ok(s) => s,
             Err(_) => return false,
         };
-        let ext = self
-            .current_fs_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
         // Keep verbatim lines for write-back (indentation + blank lines preserved).
         self.trailing_newline = contents.ends_with('\n');
         self.source_lines = contents.lines().map(str::to_owned).collect();
 
-        // Parse into an annotated FFON tree, then wrap every element in <input>
-        // so the app renders each line as editable.
-        let tree = parse::parse_file_ext(&contents, ext);
-        self.cached_ffon = wrap_ffon_in_input(tree);
+        // One annotated row per line, each wrapped in <input> so the app
+        // renders it as editable.
+        self.cached_ffon = wrap_ffon_in_input(parse::parse_lines(&contents));
         self.loaded_path = Some(self.current_fs_path.clone());
         true
     }
@@ -265,12 +258,7 @@ impl TextEditorProvider {
                 None => self.cached_ffon.clone(),
             };
         }
-        let tree = &self.cached_ffon;
-        if self.ffon_sub_path.is_empty() {
-            tree.clone()
-        } else {
-            parse::navigate_path(tree, &self.ffon_sub_path).to_vec()
-        }
+        self.cached_ffon.clone()
     }
 
     /// Write `source_lines` back to `current_fs_path` and rebuild `cached_ffon`.
@@ -305,13 +293,7 @@ impl TextEditorProvider {
         // vector slot maps to exactly one file line.
         self.source_lines = content.lines().map(str::to_owned).collect();
         // Rebuild cache from the just-written content.
-        let ext = self
-            .current_fs_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let tree = parse::parse_file_ext(&content, ext);
-        self.cached_ffon = wrap_ffon_in_input(tree);
+        self.cached_ffon = wrap_ffon_in_input(parse::parse_lines(&content));
         Ok(())
     }
 
@@ -425,11 +407,14 @@ impl Plugin for TextEditorProvider {
         let clean = tags::strip_display(segment);
         let clean = clean.trim_end_matches('/');
         if self.real(&self.current_fs_path).is_file() {
+            // A text file is one flat list of its lines: only a `.ff` file has
+            // levels to enter. (A tab saved inside a code block, from when
+            // braces were levels, reopens at the top of the file.)
             if self.is_ff_file() {
                 let next = self.ff_child_path(segment, clean);
                 self.ff_path = next;
+                self.ffon_sub_path.push(clean.to_string());
             }
-            self.ffon_sub_path.push(clean.to_string());
         } else {
             let candidate = self.current_fs_path.join(clean);
             if self.real(&candidate).exists() {
@@ -529,14 +514,12 @@ impl Plugin for TextEditorProvider {
                 return false;
             }
 
-            // Normal line replace: preserve original indentation. Multi-line
+            // Normal line replace. The row shows the whole line, indentation
+            // included, so the edited text is written as typed. Multi-line
             // replacements (input buffer contains `\n`, e.g. typed via
-            // Ctrl+Enter) expand into multiple source lines, each carrying the
-            // same indent — empty inner lines are kept empty so the file ends
-            // up with real blank lines.
+            // Ctrl+Enter) expand into multiple source lines.
             let new_text = tags::strip_display(&new_inner);
-            let indent = leading_whitespace(&self.source_lines[line_idx]).to_owned();
-            let new_lines = build_indented_lines(&new_text, &indent);
+            let new_lines = split_lines(&new_text);
             if new_lines.len() == 1 && self.source_lines[line_idx] == new_lines[0] {
                 return true; // nothing actually changed — still signal success
             }
@@ -545,21 +528,13 @@ impl Plugin for TextEditorProvider {
         }
 
         // ── Case 2: in-file line INSERT placeholder ─────────────────────────
-        // old_inner is "<srcins=N>": insert a new line at position N. Like
-        // Case 1, multi-line input expands into multiple lines each carrying
-        // the surrounding indent; empty input becomes a single blank line so
-        // pressing Ctrl+I and then Enter inserts a true empty line.
+        // old_inner is "<srcins=N>": insert a new line at position N, as
+        // typed. Like Case 1, multi-line input expands into multiple lines;
+        // empty input becomes a single blank line so pressing Ctrl+I and then
+        // Enter inserts a true empty line.
         if let Some(insert_idx) = tags::extract_src_insert(&old_inner) {
             let new_text = tags::strip_display(&new_inner);
-            // Determine the indent from the line that will be displaced (if any).
-            let indent = if insert_idx < self.source_lines.len() {
-                leading_whitespace(&self.source_lines[insert_idx]).to_owned()
-            } else if !self.source_lines.is_empty() {
-                leading_whitespace(self.source_lines.last().unwrap()).to_owned()
-            } else {
-                String::new()
-            };
-            let new_lines = build_indented_lines(&new_text, &indent);
+            let new_lines = split_lines(&new_text);
             let clamp = insert_idx.min(self.source_lines.len());
             self.source_lines
                 .splice(clamp..clamp, new_lines.iter().cloned());
@@ -580,7 +555,7 @@ impl Plugin for TextEditorProvider {
             if new_text.is_empty() {
                 return false;
             }
-            let new_lines = build_indented_lines(&new_text, "");
+            let new_lines = split_lines(&new_text);
             let pos = self.source_lines.len();
             self.source_lines
                 .splice(pos..pos, new_lines.iter().cloned());
@@ -1248,11 +1223,6 @@ fn decode_snapshot(payload: &FfonElement) -> Option<FsSideEffect> {
     fs_snapshot::decode(&bytes)
 }
 
-fn leading_whitespace(s: &str) -> &str {
-    let end = s.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-    &s[..end]
-}
-
 /// Decode a `texteditor.delete_line` / `texteditor.insert_lines` timeline
 /// payload into its `(line_index, text)` pair. The payload key is `<src=N>text`,
 /// optionally wrapped in `<input>…</input>`. For an insert the `text` is the
@@ -1266,19 +1236,11 @@ fn decode_line_payload(payload: &FfonElement) -> Option<(usize, String)> {
     tags::extract_src(&inner).map(|(idx, text)| (idx, text.to_owned()))
 }
 
-/// Split `text` on `\n` into one source line per piece, prepending `indent`
-/// to non-empty pieces. Empty input → a single empty line; trailing/leading
-/// `\n` produce blank lines so the on-disk file actually contains them.
-fn build_indented_lines(text: &str, indent: &str) -> Vec<String> {
-    text.split('\n')
-        .map(|piece| {
-            if piece.is_empty() {
-                String::new()
-            } else {
-                format!("{indent}{piece}")
-            }
-        })
-        .collect()
+/// Split `text` on `\n` into one source line per piece, each written as typed.
+/// Empty input → a single empty line; trailing/leading `\n` produce blank
+/// lines so the on-disk file actually contains them.
+fn split_lines(text: &str) -> Vec<String> {
+    text.split('\n').map(str::to_owned).collect()
 }
 
 #[cfg(test)]
@@ -1453,7 +1415,9 @@ mod tests {
     }
 
     #[test]
-    fn current_path_includes_ffon_sub_path() {
+    fn a_text_file_has_no_levels_to_enter() {
+        // Braces and `:` are plain lines, so Right on one enters nothing and
+        // the path stays at the file.
         let tmp = make_tmp();
         let file = tmp.path().join("data.txt");
         std::fs::write(&file, "section:\n{\n  child\n}").unwrap();
@@ -1463,21 +1427,12 @@ mod tests {
         let path_at_file = p.current_path().to_string();
 
         p.push_path("section:");
-        let path_at_section = p.current_path().to_string();
+        assert_eq!(p.current_path(), path_at_file);
+        assert_eq!(p.fetch().len(), 4);
 
-        assert_ne!(path_at_file, path_at_section);
-        assert!(
-            path_at_section.contains("section:"),
-            "current_path should include the FFON segment, got: {}",
-            path_at_section
-        );
-
+        // So Left leaves the file.
         p.pop_path();
-        assert_eq!(
-            p.current_path(),
-            path_at_file,
-            "popping the FFON segment must restore the file path"
-        );
+        assert_eq!(p.current_path(), tmp.path().display().to_string());
     }
 
     #[test]
@@ -1587,9 +1542,9 @@ mod tests {
         let mut p = make_text_editor(&tmp);
         p.push_path("code.txt");
         let items = p.fetch();
-        assert_eq!(items.len(), 2);
-        assert!(items[0].is_obj());
-        assert!(items[1].is_str());
+        // One row per line, braces included: nothing opens a level.
+        assert_eq!(items.len(), 5);
+        assert!(items.iter().all(FfonElement::is_str));
         // All items must be <input>-wrapped and carry <src=N>
         for item in &items {
             let key = match item {
@@ -1606,20 +1561,45 @@ mod tests {
         }
     }
 
+    /// The text each row shows, `<input>` and `<src=N>` removed.
+    fn row_texts(items: &[FfonElement]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| {
+                let inner = tags::extract_input(item.as_str().unwrap()).unwrap();
+                tags::extract_src(&inner).unwrap().1.to_owned()
+            })
+            .collect()
+    }
+
     #[test]
-    fn push_into_ffon_section_navigates_sub_path() {
+    fn code_file_rows_keep_their_indentation() {
         let tmp = make_tmp();
-        let file = tmp.path().join("data.txt");
-        std::fs::write(&file, "section:\n{\n  child\n}").unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn x() {\n    if y {\n\tz();\n    }\n}\n")
+            .unwrap();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
 
         let mut p = make_text_editor(&tmp);
-        p.push_path("data.txt");
-        p.push_path("section:");
-        let items = p.fetch();
-        assert_eq!(items.len(), 1);
-        // Child element must carry <src=N>
-        let inner = tags::extract_input(items[0].as_str().unwrap()).unwrap();
-        assert!(tags::extract_src(&inner).is_some());
+        p.push_path("main.rs");
+        assert_eq!(
+            row_texts(&p.fetch()),
+            ["fn x() {", "    if y {", "\tz();", "    }", "}"]
+        );
+        p.pop_path();
+        p.push_path("a.py");
+        assert_eq!(row_texts(&p.fetch()), ["def f():", "    return 1"]);
+    }
+
+    #[test]
+    fn a_tab_saved_inside_a_code_block_reopens_at_the_top_of_the_file() {
+        // Braces used to be levels, so a saved tab can name one.
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join("main.rs"), "fn x() {\n    y();\n}\n").unwrap();
+
+        let mut p = make_text_editor(&tmp);
+        let path = format!("{}/main.rs/fn x() {{", tmp.path().display());
+        p.set_current_path(&path);
+        assert_eq!(row_texts(&p.fetch()), ["fn x() {", "    y();", "}"]);
     }
 
     #[test]
@@ -1844,13 +1824,30 @@ mod tests {
         p.push_path("py.py");
         p.fetch();
 
-        // Line 1 is "    pass" (4 spaces). Editing with stripped content "pass".
-        let old = format!("<input>{}pass</input>", tags::format_src(1));
-        let ok = p.commit_edit(&old, "return 1");
+        // Line 1 is "    pass": the row shows the indent, and the edit keeps it.
+        let old = format!("<input>{}    pass</input>", tags::format_src(1));
+        let ok = p.commit_edit(&old, "    return 1");
         assert!(ok);
 
         let written = std::fs::read_to_string(&file).unwrap();
         assert_eq!(written, "def foo():\n    return 1\n");
+    }
+
+    #[test]
+    fn commit_edit_writes_a_changed_indent_as_typed() {
+        let tmp = make_tmp();
+        let file = tmp.path().join("py.py");
+        std::fs::write(&file, "def foo():\n    pass\n").unwrap();
+
+        let mut p = make_text_editor(&tmp);
+        p.push_path("py.py");
+        p.fetch();
+
+        let old = format!("<input>{}    pass</input>", tags::format_src(1));
+        assert!(p.commit_edit(&old, "  \treturn 1"));
+
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(written, "def foo():\n  \treturn 1\n");
     }
 
     #[test]
@@ -1912,9 +1909,9 @@ mod tests {
     }
 
     #[test]
-    fn commit_edit_multiline_replace_writes_each_line_with_indent() {
+    fn commit_edit_multiline_replace_writes_each_line_verbatim() {
         // Multi-line input from Ctrl+Enter expands into multiple file lines,
-        // each preserving the original indentation of the line being replaced.
+        // each with the indentation typed for it.
         let tmp = make_tmp();
         let file = tmp.path().join("py.py");
         std::fs::write(&file, "def foo():\n    pass\n").unwrap();
@@ -1924,8 +1921,8 @@ mod tests {
         p.fetch();
 
         // Replace line 1 ("    pass") with two lines.
-        let old = format!("<input>{}pass</input>", tags::format_src(1));
-        let ok = p.commit_edit(&old, "x = 1\ny = 2");
+        let old = format!("<input>{}    pass</input>", tags::format_src(1));
+        let ok = p.commit_edit(&old, "    x = 1\n    y = 2");
         assert!(ok);
 
         let written = std::fs::read_to_string(&file).unwrap();
@@ -1979,8 +1976,8 @@ mod tests {
 
     #[test]
     fn commit_edit_insert_multiline() {
-        // Ctrl+I, type "first\nsecond\nthird", Enter — three lines inserted
-        // before the displaced line, each at the displaced line's indent.
+        // Ctrl+I, type three indented lines, Enter: they are inserted before
+        // the displaced line, as typed.
         let tmp = make_tmp();
         let file = tmp.path().join("py.py");
         std::fs::write(&file, "def foo():\n    pass\n").unwrap();
@@ -1990,7 +1987,7 @@ mod tests {
         p.fetch();
 
         let old = format!("<input>{}</input>", tags::format_src_insert(1));
-        assert!(p.commit_edit(&old, "a = 1\nb = 2\nc = 3"));
+        assert!(p.commit_edit(&old, "    a = 1\n    b = 2\n    c = 3"));
 
         let written = std::fs::read_to_string(&file).unwrap();
         assert_eq!(

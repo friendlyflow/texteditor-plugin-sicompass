@@ -5,9 +5,8 @@
 This plugin is part of [Sicompass](https://github.com/friendlyflow/sicompass), a
 keyboard-first, accessibility-first way to use your entire computer.
 
-The text editor opens a text file as a list of its lines. Indentation and
-braces in Python, C-family, Rust, Go, JavaScript and TypeScript files become
-levels, so you walk a function the way you walk a folder. i edits a line, ctrl+a
+The text editor opens a text file as a list of its lines, each shown as it is
+in the file, indentation included. i edits a line, ctrl+a
 and ctrl+i insert one, ctrl+d deletes one, and every change is written to disk
 and can be undone with ctrl+z.
 

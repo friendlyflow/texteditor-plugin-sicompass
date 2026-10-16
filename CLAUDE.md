@@ -20,8 +20,10 @@ GitHub releases, one build per platform. The plugin platform is described in
   `"filesystem": ["/"]`, the whole disk, which the user approves at install.
 - `locales/<lang>.ftl`, every id prefixed `texteditor-`, in all four
   languages.
-- `src/parse.rs` turns a file into the FFON tree; every element carries a
-  `<src=N>` source-line annotation, which is how edits map back to lines.
+- `src/parse.rs` turns a text file into one row per line, verbatim
+  (indentation kept, no levels). Every row carries a `<src=N>` source-line
+  annotation, which is how edits map back to lines. Only a `.ff` file
+  (`src/ff.rs`) has levels.
 
 ## What it does itself, and what it asks the app
 

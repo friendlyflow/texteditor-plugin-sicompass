@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A text file opens as its lines, each with its indentation, like any text
+  editor. Braces and Python's `:` no longer open levels, and an edit writes
+  the line as you typed it, indentation included.
 - Opens, edits and saves `.ff` files, a binary tree of nodes where every node
   carries a SHA-256 hash of its children and its text (a Merkle tree). A node
   whose text ends in `:` is a level to enter. Every Enter writes the file, and
