@@ -364,7 +364,11 @@ impl FfDoc {
 
 /// `node`, numbered `n`, as the element the app shows.
 fn element(node: &Node, n: usize) -> FfonElement {
-    let key = tags::format_input(&format!("{}{}", tags::format_src(n), node.content));
+    let key = tags::format_input(&format!(
+        "{}{}",
+        tags::format_src(n),
+        tags::escape(&node.content)
+    ));
     if !node.is_branch() {
         return FfonElement::Str(key);
     }

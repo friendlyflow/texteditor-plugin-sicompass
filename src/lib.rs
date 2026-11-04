@@ -27,6 +27,11 @@
 //!
 //! `textEditorPath` defaults to `~`, which the app expands to the user's home
 //! folder before the plugin sees it.
+//!
+//! `plugin.json` declares `markup`, so a file name or a line reaches a row through
+//! `tags::escape`: a line `<style>...` stays a line. `source_lines` and a `.ff`
+//! node hold the real text, and only the rows are escaped, so nothing on disk ever
+//! gains a backslash.
 
 mod desktop;
 pub mod ff;
@@ -217,7 +222,7 @@ impl TextEditorProvider {
             .into_iter()
             .map(|(is_dir, name)| {
                 let marker = if is_dir { "<dir>" } else { "<file>" };
-                let tagged = format!("{marker}{}", tags::format_input(&name));
+                let tagged = format!("{marker}{}", tags::format_input(&tags::escape(&name)));
                 FfonElement::new_obj(&tagged)
             })
             .collect()
@@ -297,15 +302,14 @@ impl TextEditorProvider {
         Ok(())
     }
 
-    fn rename_fs_item(&mut self, old: &str, new: &str) -> bool {
+    fn rename_fs_item(&mut self, old: &str, new_name: &str) -> bool {
         let old_name = tags::strip_display(old);
-        let new_name = tags::strip_display(new);
         if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
             return false;
         }
         let dir = self.real(&self.current_fs_path);
-        let old_name = old_name.trim_end_matches('/').trim_end_matches('\\');
-        let new_name = new_name.trim_end_matches('/').trim_end_matches('\\');
+        let old_name = trim_separators(&old_name);
+        let new_name = trim_separators(new_name);
         match std::fs::rename(dir.join(old_name), dir.join(new_name)) {
             Ok(()) => true,
             Err(e) => {
@@ -404,19 +408,33 @@ impl Plugin for TextEditorProvider {
     }
 
     fn push_path(&mut self, segment: &str) {
-        let clean = tags::strip_display(segment);
-        let clean = clean.trim_end_matches('/');
+        let stripped = tags::strip_display(segment);
+        let clean = stripped.trim_end_matches('/');
         if self.real(&self.current_fs_path).is_file() {
             // A text file is one flat list of its lines: only a `.ff` file has
             // levels to enter. (A tab saved inside a code block, from when
             // braces were levels, reopens at the top of the file.)
             if self.is_ff_file() {
                 let next = self.ff_child_path(segment, clean);
+                let named = self
+                    .ff
+                    .as_ref()
+                    .and_then(|doc| doc.node_at(&next))
+                    .is_some_and(|node| node.content == segment);
                 self.ff_path = next;
-                self.ffon_sub_path.push(clean.to_string());
+                let name = if named { segment } else { clean };
+                self.ffon_sub_path.push(name.to_string());
             }
         } else {
-            let candidate = self.current_fs_path.join(clean);
+            // Right sends the inside of the row's `<input>`, escaped, and the app's
+            // own walks send a real name, and `<input>y` reads like a row then. A
+            // name that is there is taken at its word.
+            let literal = self.current_fs_path.join(segment.trim_end_matches('/'));
+            let candidate = if self.real(&literal).exists() {
+                literal
+            } else {
+                self.current_fs_path.join(clean)
+            };
             if self.real(&candidate).exists() {
                 // Entering a new path invalidates the file cache.
                 self.loaded_path = None;
@@ -489,11 +507,21 @@ impl Plugin for TextEditorProvider {
         // Unwrap <input>...</input> wrappers that may be present (e.g. from
         // undo/redo paths where FsRename passes element keys verbatim).
         let old_inner = tags::extract_input(old).unwrap_or_else(|| old.to_owned());
-        let new_inner = tags::extract_input(new).unwrap_or_else(|| new.to_owned());
+        // The app sends what was typed as it was typed, so it is not read for
+        // tags: a typed `<input>y</input>` or `a\<b` is a line like any other, and
+        // goes to disk as it is. Only an undo or redo replays whole rows, as both
+        // `old` and `new`, escaped as rows are.
+        let replayed = tags::extract_input(old).and_then(|_| tags::extract_input(new));
+        let new_text = match &replayed {
+            Some(inner) => tags::strip_display(inner),
+            None => new.to_owned(),
+        };
+        // An undo of a line insert: the row it replays is `<srcins=N>`.
+        let taken_out = replayed.as_deref().and_then(tags::extract_src_insert);
 
         // A `.ff` file is a tree of nodes, not lines.
         if self.is_ff_file() {
-            return self.ff_commit_edit(&old_inner, &new_inner);
+            return self.ff_commit_edit(&old_inner, &new_text, taken_out.is_some());
         }
 
         // ── Case 1: in-file line REPLACE ────────────────────────────────────
@@ -502,10 +530,10 @@ impl Plugin for TextEditorProvider {
             if line_idx >= self.source_lines.len() {
                 return false;
             }
-            // new_inner may be:
+            // The new text may be:
             //  a) "<srcins=N>"  → undo of a prior line insert: delete line N
             //  b) plain text   → replace the line with new content
-            if let Some(del_idx) = tags::extract_src_insert(&new_inner) {
+            if let Some(del_idx) = taken_out {
                 // Undo of a line insert: delete line del_idx.
                 if del_idx < self.source_lines.len() {
                     self.source_lines.remove(del_idx);
@@ -518,7 +546,6 @@ impl Plugin for TextEditorProvider {
             // included, so the edited text is written as typed. Multi-line
             // replacements (input buffer contains `\n`, e.g. typed via
             // Ctrl+Enter) expand into multiple source lines.
-            let new_text = tags::strip_display(&new_inner);
             let new_lines = split_lines(&new_text);
             if new_lines.len() == 1 && self.source_lines[line_idx] == new_lines[0] {
                 return true; // nothing actually changed — still signal success
@@ -533,7 +560,6 @@ impl Plugin for TextEditorProvider {
         // empty input becomes a single blank line so pressing Ctrl+I and then
         // Enter inserts a true empty line.
         if let Some(insert_idx) = tags::extract_src_insert(&old_inner) {
-            let new_text = tags::strip_display(&new_inner);
             let new_lines = split_lines(&new_text);
             let clamp = insert_idx.min(self.source_lines.len());
             self.source_lines
@@ -550,11 +576,7 @@ impl Plugin for TextEditorProvider {
         // placeholder seeded by `navigate_right_raw` so the user has something
         // to type into. The Enter handler then calls commit_edit with an empty
         // `old` string. Insert the typed text as new file lines.
-        if old_inner.is_empty() && !new_inner.is_empty() && self.is_in_file_view() {
-            let new_text = tags::strip_display(&new_inner);
-            if new_text.is_empty() {
-                return false;
-            }
+        if old_inner.is_empty() && !new_text.is_empty() && self.is_in_file_view() {
             let new_lines = split_lines(&new_text);
             let pos = self.source_lines.len();
             self.source_lines
@@ -569,17 +591,17 @@ impl Plugin for TextEditorProvider {
         }
 
         // ── Case 3: directory create (old is empty = new item from placeholder) ─
-        if old_inner.is_empty() && !new_inner.is_empty() && !self.is_in_file_view() {
-            return if new_inner.ends_with(':') {
-                self.create_directory(new_inner.trim_end_matches(':'))
+        if old_inner.is_empty() && !new_text.is_empty() && !self.is_in_file_view() {
+            return if new_text.ends_with(':') {
+                self.create_directory(new_text.trim_end_matches(':'))
             } else {
-                self.create_file(&new_inner)
+                self.create_file(&new_text)
             };
         }
 
         // ── Case 4: directory rename ─────────────────────────────────────────
         if !self.is_in_file_view() {
-            return self.rename_fs_item(old, new);
+            return self.rename_fs_item(old, &new_text);
         }
 
         false
@@ -624,7 +646,10 @@ impl Plugin for TextEditorProvider {
         if self.is_ff_file() {
             return self.ff_delete(&inner);
         }
-        if let Some((line_idx, _)) = tags::extract_src(&inner) {
+        // In a folder a row's `<src=N>` can only be a file's name.
+        if self.is_in_file_view()
+            && let Some((line_idx, _)) = tags::extract_src(&inner)
+        {
             if line_idx >= self.source_lines.len() {
                 return false;
             }
@@ -647,12 +672,21 @@ impl Plugin for TextEditorProvider {
         }
 
         // Directory view: move file/folder to OS trash.
-        let clean = tags::strip_display(name);
-        let clean = clean.trim_end_matches('/').trim_end_matches('\\');
+        // A row comes back as it was written, escaped, but the app's cut and undo
+        // send a name through `strip_display` first, and `<input>y` still reads
+        // like a row then. A name that is there is taken at its word.
+        let dir = self.real(&self.current_fs_path);
+        let literal = trim_separators(name);
+        let clean = if !literal.is_empty() && std::fs::symlink_metadata(dir.join(literal)).is_ok() {
+            literal.to_owned()
+        } else {
+            trim_separators(&tags::strip_display(name)).to_owned()
+        };
+        let clean = clean.as_str();
         if clean.is_empty() {
             return false;
         }
-        let full = self.real(&self.current_fs_path).join(clean);
+        let full = dir.join(clean);
         // Snapshot before trashing so an undo can restore even if the OS trash
         // is later emptied (see `sicompass_sdk::fs_snapshot`).
         let side_effect = fs_snapshot::snapshot_for_delete(&full);
@@ -899,6 +933,15 @@ impl TextEditorProvider {
             path.push(FF_HEADER);
             return path;
         }
+        // The app sends a node through `strip_display`, and `<src=5>x` still reads
+        // like a row then. A child called that is the one it means.
+        if let Some(pos) = doc
+            .node_at(&path)
+            .and_then(|p| p.children.iter().position(|c| c.content == segment))
+        {
+            path.push(pos);
+            return path;
+        }
         if let Some(found) = tags::extract_src(&inner).and_then(|(n, _)| doc.path_of(n))
             && found.len() == self.ffon_sub_path.len() + 1
         {
@@ -937,9 +980,9 @@ impl TextEditorProvider {
         )
     }
 
-    /// `commit_edit` in a `.ff` file. `old` and `new` are unwrapped from
-    /// their `<input>`.
-    fn ff_commit_edit(&mut self, old: &str, new: &str) -> bool {
+    /// `commit_edit` in a `.ff` file. `old` is unwrapped from its `<input>`, `text`
+    /// is the real new text, and `taken_out` says this is an undo of an insert.
+    fn ff_commit_edit(&mut self, old: &str, text: &str, taken_out: bool) -> bool {
         self.ensure_file_loaded();
         let Some(doc) = self.ff.as_mut() else {
             return false;
@@ -948,11 +991,10 @@ impl TextEditorProvider {
         // Node N's content, or (an undo of an insert, `<srcins>` in `new`)
         // node N taken back out.
         if let Some((n, _)) = tags::extract_src(old) {
-            if tags::extract_src_insert(new).is_some() {
+            if taken_out {
                 return doc.delete(n).is_some() && self.write_ff();
             }
-            let text = tags::strip_display(new);
-            return match doc.replace(n, &text) {
+            return match doc.replace(n, text) {
                 Ok(true) => self.write_ff(),
                 Ok(false) => true,
                 Err(e) => self.ff_refuse(e),
@@ -961,7 +1003,6 @@ impl TextEditorProvider {
 
         // A new node: at `<srcins=M>` (Ctrl+I, Ctrl+A), or after the last
         // child for the `i` placeholder of an empty level (an empty `old`).
-        let text = tags::strip_display(new);
         let pos = match tags::extract_src_insert(old) {
             Some(m) => doc.srcins_position(&self.ff_path, m),
             None if old.is_empty() && !text.is_empty() => {
@@ -1232,8 +1273,23 @@ fn decode_line_payload(payload: &FfonElement) -> Option<(usize, String)> {
         FfonElement::Str(s) => s.as_str(),
         FfonElement::Obj(o) => o.key.as_str(),
     };
-    let inner = tags::extract_input(key).unwrap_or_else(|| key.to_owned());
+    // The `<src=N>` first: the text after it is a real line, and a line
+    // `<input>y</input>` is not a wrapper.
+    if let Some((idx, text)) = tags::extract_src(key) {
+        return Some((idx, text.to_owned()));
+    }
+    let inner = tags::extract_input(key)?;
     tags::extract_src(&inner).map(|(idx, text)| (idx, text.to_owned()))
+}
+
+/// `name` without its trailing separators. A backslash is a separator on Windows
+/// only: anywhere else it is part of the name, and trimming it would name another
+/// file.
+fn trim_separators(name: &str) -> &str {
+    let name = name.trim_end_matches('/');
+    #[cfg(windows)]
+    let name = name.trim_end_matches('\\');
+    name
 }
 
 /// Split `text` on `\n` into one source line per piece, each written as typed.
@@ -1575,8 +1631,11 @@ mod tests {
     #[test]
     fn code_file_rows_keep_their_indentation() {
         let tmp = make_tmp();
-        std::fs::write(tmp.path().join("main.rs"), "fn x() {\n    if y {\n\tz();\n    }\n}\n")
-            .unwrap();
+        std::fs::write(
+            tmp.path().join("main.rs"),
+            "fn x() {\n    if y {\n\tz();\n    }\n}\n",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
 
         let mut p = make_text_editor(&tmp);
@@ -2530,7 +2589,10 @@ mod tests {
             "",
             vec![
                 ff_leaf("a"),
-                ff_branch("b:", vec![ff_leaf("c"), ff_branch("d:", vec![ff_leaf("deep")])]),
+                ff_branch(
+                    "b:",
+                    vec![ff_leaf("c"), ff_branch("d:", vec![ff_leaf("deep")])],
+                ),
             ],
         );
         let (mut p, _file) = open_ff(&tmp, &root);
@@ -2844,6 +2906,409 @@ mod tests {
         assert!(!p.commit_edit("header", "renamed"));
         assert!(!p.delete_item("header"));
         assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    // --- markup: `plugin.json` asks for it, so every name and line is this plugin's to escape ---
+
+    /// Lines that would read as tags. Every one must reach the disk as it is.
+    const ODD_LINES: [&str; 9] = [
+        "<b>x.txt",
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<src=3>z",
+        "<srcins=0>",
+        "<button>f</button>go",
+        "</input>",
+        r"a\<b",
+        r"ends in a backslash\",
+    ];
+
+    /// Names a filesystem can hold that would read as tags. A name cannot hold a
+    /// `/`, so `<input>y</input>` itself cannot be one.
+    const ODD_NAMES: [&str; 6] = [
+        "<b>x.txt",
+        "<style>li { color: red }",
+        "<input>y",
+        "<src=3>z",
+        r"a\<b",
+        r"ends in a backslash\",
+    ];
+
+    fn key(e: &FfonElement) -> &str {
+        match e {
+            FfonElement::Str(s) => s,
+            FfonElement::Obj(o) => &o.key,
+        }
+    }
+
+    /// What the app sends as `old`: the inside of the row's `<input>`.
+    fn old_of(row: &str) -> String {
+        tags::extract_input(row).expect("every row has an input")
+    }
+
+    fn row_named(p: &mut TextEditorProvider, name: &str) -> String {
+        let items = p.fetch();
+        let row = items
+            .iter()
+            .map(key)
+            .find(|k| tags::strip_display(k) == name);
+        row.unwrap_or_else(|| panic!("no row shows {name:?}"))
+            .to_owned()
+    }
+
+    fn open_lines(tmp: &TempDir, contents: &str) -> (TextEditorProvider, PathBuf) {
+        let file = tmp.path().join("sample.txt");
+        std::fs::write(&file, contents).unwrap();
+        let mut p = make_text_editor(tmp);
+        p.push_path("sample.txt");
+        p.fetch();
+        (p, file)
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn a_line_that_looks_like_a_tag_is_shown_as_it_is() {
+        let tmp = make_tmp();
+        let (mut p, _) = open_lines(&tmp, &ODD_LINES.join("\n"));
+        let items = p.fetch();
+        assert_eq!(items.len(), ODD_LINES.len());
+        for (item, line) in items.iter().zip(ODD_LINES) {
+            let row = key(item);
+            assert!(!sicompass_sdk::markup::has_markup(row), "{row}");
+            assert_eq!(sicompass_sdk::markup::style_sheet(row), None, "{row}");
+            assert_eq!(tags::strip_display(row), line);
+            assert!(!tags::has_button(row), "{row}");
+            assert!(!tags::has_link(row), "{row}");
+        }
+    }
+
+    /// Editing one line leaves every other byte of the file where it was.
+    #[test]
+    fn editing_a_line_leaves_the_others_byte_identical() {
+        let tmp = make_tmp();
+        let contents = format!("{}\n", ODD_LINES.join("\n"));
+        for i in 0..ODD_LINES.len() {
+            let (mut p, file) = open_lines(&tmp, &contents);
+            let items = p.fetch();
+            assert!(
+                p.commit_edit(&old_of(key(&items[i])), "changed"),
+                "line {i}"
+            );
+            let mut expected: Vec<&str> = ODD_LINES.to_vec();
+            expected[i] = "changed";
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!("{}\n", expected.join("\n"))
+            );
+        }
+    }
+
+    /// Enter on a line, untouched: the app sends back the text it showed.
+    #[test]
+    fn committing_a_line_unchanged_writes_nothing_new() {
+        let tmp = make_tmp();
+        let contents = format!("{}\n", ODD_LINES.join("\n"));
+        let (mut p, file) = open_lines(&tmp, &contents);
+        let items = p.fetch();
+        for (item, line) in items.iter().zip(ODD_LINES) {
+            let row = key(item);
+            assert!(p.commit_edit(&old_of(row), &tags::strip_display(row)));
+            assert_eq!(tags::strip_display(row), line);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn a_typed_line_reaches_the_disk_as_typed_and_undo_takes_it_back() {
+        for line in ODD_LINES {
+            let tmp = make_tmp();
+            let (mut p, file) = open_lines(&tmp, "first\nplain\nlast\n");
+            let before = key(&p.fetch()[1]).to_owned();
+            assert!(p.commit_edit(&old_of(&before), line), "{line:?}");
+            let written = format!("first\n{line}\nlast\n");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+
+            // The row comes back from disk showing what was typed.
+            let after = key(&p.fetch()[1]).to_owned();
+            assert_eq!(tags::strip_display(&after), line);
+            assert!(!sicompass_sdk::markup::has_markup(&after), "{after}");
+
+            // An undo and a redo replay the two rows whole.
+            assert!(p.commit_edit(&after, &before), "undo of {line:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "first\nplain\nlast\n"
+            );
+            assert!(p.commit_edit(&before, &after), "redo of {line:?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+        }
+    }
+
+    /// Typed `<srcins=0>` used to read as an undo of an insert, and took the line
+    /// out of the file instead of writing it.
+    #[test]
+    fn a_typed_srcins_is_a_line_and_deletes_nothing() {
+        let tmp = make_tmp();
+        let (mut p, file) = open_lines(&tmp, "one\ntwo\n");
+        let row = key(&p.fetch()[1]).to_owned();
+        assert!(p.commit_edit(&old_of(&row), "<srcins=0>"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n<srcins=0>\n");
+    }
+
+    #[test]
+    fn an_inserted_line_is_written_as_typed_and_undo_redo_replay_it() {
+        for line in ODD_LINES {
+            let tmp = make_tmp();
+            let (mut p, file) = open_lines(&tmp, "one\ntwo\n");
+            let old = tags::format_src_insert(1);
+            assert!(p.commit_edit(&old, line), "{line:?}");
+            let written = format!("one\n{line}\ntwo\n");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+
+            let entry = p.take_timeline_entries().pop().expect("an insert entry");
+            p.undo(&entry).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+            p.redo(&entry).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+        }
+    }
+
+    #[test]
+    fn the_first_line_of_an_empty_file_is_written_as_typed() {
+        for line in ODD_LINES {
+            let tmp = make_tmp();
+            let (mut p, file) = open_lines(&tmp, "");
+            assert!(p.commit_edit("", line), "{line:?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), line);
+        }
+    }
+
+    /// A deleted line rides in its undo payload as `<src=N>line`. A line
+    /// `<input>y</input>` used to read as the payload's wrapper, and the undo did
+    /// nothing.
+    #[test]
+    fn a_deleted_line_comes_back_byte_identical() {
+        for line in ODD_LINES {
+            let tmp = make_tmp();
+            let contents = format!("one\n{line}\ntwo\n");
+            let (mut p, file) = open_lines(&tmp, &contents);
+            let row = key(&p.fetch()[1]).to_owned();
+            assert!(p.delete_item(&row), "{line:?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+
+            let entry = p.take_timeline_entries().pop().expect("a delete entry");
+            p.undo(&entry).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), contents);
+            p.redo(&entry).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+        }
+    }
+
+    #[test]
+    fn a_name_that_looks_like_a_tag_is_shown_as_it_is() {
+        for name in ODD_NAMES {
+            let tmp = make_tmp();
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+            let mut p = make_text_editor(&tmp);
+            let row = row_named(&mut p, name);
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+            assert_eq!(sicompass_sdk::markup::style_sheet(&row), None, "{row}");
+        }
+    }
+
+    #[test]
+    fn a_rename_finds_the_real_file_and_gives_it_the_typed_name() {
+        for name in ODD_NAMES {
+            let tmp = make_tmp();
+            std::fs::write(tmp.path().join(name), b"kept").unwrap();
+            let mut p = make_text_editor(&tmp);
+
+            let row = row_named(&mut p, name);
+            assert!(p.commit_edit(&old_of(&row), "plain.txt"), "from {name:?}");
+            assert!(!tmp.path().join(name).exists(), "{name:?}");
+            assert_eq!(
+                std::fs::read(tmp.path().join("plain.txt")).unwrap(),
+                b"kept"
+            );
+
+            let row = row_named(&mut p, "plain.txt");
+            assert!(p.commit_edit(&old_of(&row), name), "to {name:?}");
+            assert_eq!(std::fs::read(tmp.path().join(name)).unwrap(), b"kept");
+            row_named(&mut p, name);
+        }
+    }
+
+    /// An undo replays the two rows whole, both escaped.
+    #[test]
+    fn an_undo_of_a_rename_reads_both_rows() {
+        for name in ODD_NAMES {
+            let tmp = make_tmp();
+            std::fs::write(tmp.path().join(name), b"kept").unwrap();
+            let mut p = make_text_editor(&tmp);
+            let before = row_named(&mut p, name);
+            assert!(p.commit_edit(&old_of(&before), "after.txt"));
+            let after = row_named(&mut p, "after.txt");
+            assert!(p.commit_edit(&after, &before), "undo to {name:?}");
+            assert_eq!(std::fs::read(tmp.path().join(name)).unwrap(), b"kept");
+        }
+    }
+
+    #[test]
+    fn a_typed_name_with_a_whole_tag_in_it_is_refused_as_a_path() {
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join("kept.txt"), b"x").unwrap();
+        let mut p = make_text_editor(&tmp);
+        assert!(!p.commit_edit("kept.txt", "<input>y</input>"));
+        assert!(p.take_error().is_some(), "the system's refusal is told");
+        assert!(tmp.path().join("kept.txt").exists());
+        assert!(!tmp.path().join("y").exists());
+    }
+
+    #[test]
+    fn a_new_file_or_folder_takes_the_typed_name_as_it_is() {
+        let tmp = make_tmp();
+        let mut p = make_text_editor(&tmp);
+        assert!(p.commit_edit("", "<input>y"));
+        assert!(tmp.path().join("<input>y").is_file());
+        assert!(p.commit_edit("", r"a\<b"));
+        assert!(tmp.path().join(r"a\<b").is_file());
+        assert!(p.commit_edit("", "<b>dir:"));
+        assert!(tmp.path().join("<b>dir").is_dir());
+    }
+
+    #[test]
+    fn a_delete_finds_the_real_file_from_its_row_and_from_its_name() {
+        for name in ODD_NAMES {
+            let tmp = make_tmp();
+            let mut p = make_text_editor(&tmp);
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+            let row = row_named(&mut p, name);
+            assert!(p.delete_item(&row), "row of {name:?}");
+            assert!(!tmp.path().join(name).exists(), "row of {name:?}");
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+            assert!(p.delete_item(name), "name {name:?}");
+            assert!(!tmp.path().join(name).exists(), "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn opening_a_row_opens_the_real_file_and_its_lines_are_kept() {
+        for name in ODD_NAMES {
+            let tmp = make_tmp();
+            std::fs::write(tmp.path().join(name), "inside\n").unwrap();
+            let mut p = make_text_editor(&tmp);
+            let row = row_named(&mut p, name);
+            // Right sends the inside of the `<input>` (`nav_segment`), anything else
+            // the text of the row. Either is the same file.
+            p.push_path(&old_of(&row));
+            assert_eq!(p.current_path(), tmp.path().join(name).to_str().unwrap());
+            p.pop_path();
+            p.push_path(&tags::strip_display(&row));
+            assert_eq!(p.current_path(), tmp.path().join(name).to_str().unwrap());
+            let rows = p.fetch();
+            assert_eq!(tags::strip_display(key(&rows[0])), "inside", "{name:?}");
+            assert!(p.commit_edit(&old_of(key(&rows[0])), "edited"));
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(name)).unwrap(),
+                "edited\n"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ff_node_that_looks_like_a_tag_is_shown_as_it_is_and_kept_as_typed() {
+        for text in ODD_LINES {
+            let tmp = make_tmp();
+            let root = ff_branch("", vec![ff::Node::new(text), ff::Node::new("other")]);
+            let (mut p, file) = open_ff(&tmp, &root);
+            let items = p.fetch();
+            let row = key(&items[1]).to_owned();
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+            assert_eq!(tags::strip_display(&row), text);
+
+            // Edited away and typed back: the node holds the real text, no backslash.
+            assert!(p.commit_edit(&old_of(&row), "plain"), "{text:?}");
+            let on_disk = ff::decode(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(top_contents(&on_disk), ["plain", "other"]);
+
+            let plain = key(&p.fetch()[1]).to_owned();
+            assert!(p.commit_edit(&old_of(&plain), text), "{text:?}");
+            let on_disk = ff::decode(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(top_contents(&on_disk), [text, "other"]);
+            assert!(on_disk.verify());
+
+            // An undo replays the rows whole.
+            let typed = key(&p.fetch()[1]).to_owned();
+            assert!(p.commit_edit(&typed, &plain), "undo of {text:?}");
+            let on_disk = ff::decode(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(top_contents(&on_disk), ["plain", "other"]);
+        }
+    }
+
+    #[test]
+    fn a_ff_branch_that_looks_like_a_tag_opens() {
+        for text in [
+            "<b>x:",
+            "<src=1>z:",
+            "<input>y:",
+            r"a\<b:",
+            "<input>y</input>:",
+        ] {
+            let tmp = make_tmp();
+            let root = ff_branch(
+                "",
+                vec![
+                    ff::Node::new("first"),
+                    ff_branch(text, vec![ff::Node::new("inside")]),
+                ],
+            );
+            let (mut p, _) = open_ff(&tmp, &root);
+            let items = p.fetch();
+            let row = key(&items[2]);
+            assert_eq!(tags::strip_display(row), text);
+            // Right sends the inside of the `<input>`, `<src=N>` and escapes included.
+            let inner = old_of(row);
+            p.push_path(&inner);
+            let rows: Vec<String> = p
+                .fetch()
+                .iter()
+                .map(|e| tags::strip_display(key(e)))
+                .collect();
+            assert_eq!(rows, ["header", "inside"], "{text:?}");
+            p.pop_path();
+            let items = p.fetch();
+            let row = key(&items[2]);
+            p.push_path(&tags::strip_display(row));
+            let rows: Vec<String> = p
+                .fetch()
+                .iter()
+                .map(|e| tags::strip_display(key(e)))
+                .collect();
+            assert_eq!(rows, ["header", "inside"], "{text:?}");
+        }
+    }
+
+    /// `tags::has_input` does not see the `</input>` right after a backslash, so
+    /// the app offers no edit on a line or a name that ends in one (a shell
+    /// continuation, a C macro). It always did. The plugin's half works, see the
+    /// round trips above, and the row is shown right.
+    #[test]
+    fn a_line_ending_in_a_backslash_can_be_edited_in_the_app() {
+        let tmp = make_tmp();
+        let (mut p, _) = open_lines(&tmp, "cc -o x \\\n  x.c\n");
+        assert!(tags::has_input(key(&p.fetch()[0])));
+    }
+
+    #[test]
+    fn a_name_ending_in_a_backslash_can_be_edited_in_the_app() {
+        let tmp = make_tmp();
+        std::fs::write(tmp.path().join(r"ends\"), b"x").unwrap();
+        let mut p = make_text_editor(&tmp);
+        assert!(tags::has_input(&row_named(&mut p, r"ends\")));
     }
 }
 

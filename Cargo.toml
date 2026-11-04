@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model, from crates.io.
-sicompass-sdk = { version = "0.9.5", default-features = false, features = ["plugin"] }
+sicompass-sdk = { version = "0.9.12", default-features = false, features = ["plugin"] }
 # A delete's snapshot travels in an undo payload, which is FFON text.
 base64 = "0.22"
 # A `.ff` file is a Merkle tree: every node carries a SHA-256 hash.

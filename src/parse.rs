@@ -8,12 +8,15 @@ use sicompass_sdk::tags;
 ///
 /// Every row is annotated with `<src=N>`, N being the 0-based source-line
 /// index. The annotation is invisible in the UI (stripped by `strip_display`)
-/// but lets `commit_edit` map each row back to the line it changes on disk.
+/// but lets `commit_edit` map each row back to the line it changes on disk. The
+/// line itself is escaped: it is the file's text, never markup.
 pub fn parse_lines(contents: &str) -> Vec<FfonElement> {
     contents
         .lines()
         .enumerate()
-        .map(|(n, line)| FfonElement::new_str(format!("{}{}", tags::format_src(n), line)))
+        .map(|(n, line)| {
+            FfonElement::new_str(format!("{}{}", tags::format_src(n), tags::escape(line)))
+        })
         .collect()
 }
 
@@ -57,7 +60,10 @@ mod tests {
     #[test]
     fn keeps_tabs() {
         let elements = parse_lines("all:\n\tcc -o x x.c\n\t\techo nested");
-        assert_eq!(texts(&elements), ["all:", "\tcc -o x x.c", "\t\techo nested"]);
+        assert_eq!(
+            texts(&elements),
+            ["all:", "\tcc -o x x.c", "\t\techo nested"]
+        );
     }
 
     #[test]
