@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
+- A line numbers setting: none, absolute or relative. The number is last in a line's list prefix, right-aligned, and a screen reader says it before the line.
+- File lines and folder names are shown exactly as they are, and nothing on disk gains a backslash.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
 - A text file opens as its lines, each with its indentation, like any text
   editor. Braces and Python's `:` no longer open levels, and an edit writes
   the line as you typed it, indentation included.
