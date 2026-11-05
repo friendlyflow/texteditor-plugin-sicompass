@@ -16,7 +16,10 @@ GitHub releases, one build per platform. The plugin platform is described in
 
 - `plugin.json` is the manifest. Its `name` is `texteditor` and its
   `displayName` `text editor` is the settings section (`textEditorPath`,
-  default `~`, which the app expands to the home folder). It declares
+  default `~`, which the app expands to the home folder, and
+  `textEditorLineNumbers`, `none`, `absolute` or `relative`, which the app hands
+  to the renderer, since only that knows where the cursor is: the number is last
+  in a line's list prefix). It declares
   `"filesystem": ["/"]`, the whole disk, which the user approves at install.
 - `locales/<lang>.ftl`, every id prefixed `texteditor-`, in all four
   languages.
