@@ -152,10 +152,15 @@ impl TextEditorProvider {
     /// to `current_fs_path` — e.g. an undo runs after navigation cleared the
     /// cache. Without this, a delete-line undo would splice into an empty
     /// `source_lines` and flush a truncated file.
-    fn ensure_file_loaded(&mut self) {
-        if self.loaded_path.as_deref() != Some(self.current_fs_path.as_path()) {
-            self.load_file();
+    ///
+    /// Every edit starts here. The app can set the path last, after fetching the rows
+    /// it shows, and fetch no more (a restored tab), and with no lines loaded a new
+    /// line would be written as the whole file. False for a file that cannot be read.
+    fn ensure_file_loaded(&mut self) -> bool {
+        if !self.real(&self.current_fs_path).is_file() {
+            return true;
         }
+        self.loaded_path.as_deref() == Some(self.current_fs_path.as_path()) || self.load_file()
     }
 
     /// Queue an `insert_lines` timeline entry for `lines` spliced in at
@@ -504,6 +509,15 @@ impl Plugin for TextEditorProvider {
     // ---- Editing -----------------------------------------------------------
 
     fn commit_edit(&mut self, old: &str, new: &str) -> bool {
+        if !self.ensure_file_loaded() {
+            let name = self.current_fs_path.display().to_string();
+            self.error = Some(failed(
+                "texteditor-error-save",
+                &name,
+                &localize::t("texteditor-error-reason-unreadable"),
+            ));
+            return false;
+        }
         // Unwrap <input>...</input> wrappers that may be present (e.g. from
         // undo/redo paths where FsRename passes element keys verbatim).
         let old_inner = tags::extract_input(old).unwrap_or_else(|| old.to_owned());
@@ -528,6 +542,14 @@ impl Plugin for TextEditorProvider {
         // old_inner starts with <src=N>: edit the Nth source line.
         if let Some((line_idx, _old_text)) = tags::extract_src(&old_inner) {
             if line_idx >= self.source_lines.len() {
+                // The file got shorter since the row was shown. Never silently: the
+                // row would show text that is not in the file.
+                let name = self.current_fs_path.display().to_string();
+                self.error = Some(failed(
+                    "texteditor-error-save",
+                    &name,
+                    &localize::t("texteditor-error-reason-line-gone"),
+                ));
                 return false;
             }
             // The new text may be:
@@ -641,6 +663,9 @@ impl Plugin for TextEditorProvider {
     }
 
     fn delete_item(&mut self, name: &str) -> bool {
+        if !self.ensure_file_loaded() {
+            return false;
+        }
         // In-file: delete the indicated source line.
         let inner = tags::extract_input(name).unwrap_or_else(|| name.to_owned());
         if self.is_ff_file() {
@@ -1344,6 +1369,58 @@ mod tests {
         let mut p = editor();
         p.on_setting_change("textEditorPath", tmp.path().to_str().unwrap());
         p
+    }
+
+    /// A tab restored inside a file: the app sets the path last and fetches no more.
+    fn restored_in(tmp: &TempDir, contents: &str) -> (TextEditorProvider, PathBuf) {
+        let file = tmp.path().join("sample.txt");
+        std::fs::write(&file, contents).unwrap();
+        let mut p = make_text_editor(tmp);
+        p.set_current_path(file.to_str().unwrap());
+        let _ = p.fetch();
+        p.set_current_path(file.to_str().unwrap());
+        (p, file)
+    }
+
+    #[test]
+    fn an_edit_in_a_restored_tab_is_written() {
+        let tmp = TempDir::new().unwrap();
+        let (mut p, file) = restored_in(&tmp, "alpha\nbeta\ngamma");
+        assert!(p.commit_edit("<src=1>beta", "BETA"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nBETA\ngamma"
+        );
+    }
+
+    /// With no lines loaded, the new line used to be written as the whole file.
+    #[test]
+    fn a_new_line_in_a_restored_tab_keeps_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let (mut p, file) = restored_in(&tmp, "alpha\nbeta\ngamma");
+        assert!(p.commit_edit("<srcins=1>", "new"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nnew\nbeta\ngamma"
+        );
+    }
+
+    #[test]
+    fn deleting_a_line_in_a_restored_tab_keeps_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let (mut p, file) = restored_in(&tmp, "alpha\nbeta\ngamma");
+        assert!(p.delete_item("<input><src=1>beta</input>"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ngamma");
+    }
+
+    /// The row names a line the file no longer has: that is said, and nothing is written.
+    #[test]
+    fn an_edit_of_a_line_gone_from_the_file_says_so() {
+        let tmp = TempDir::new().unwrap();
+        let (mut p, file) = restored_in(&tmp, "alpha");
+        assert!(!p.commit_edit("<src=5>gone", "x"));
+        assert!(p.take_error().is_some(), "the edit must not fail silently");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha");
     }
 
     /// Outside sicompass there is no app to trash anything: the host desktop
